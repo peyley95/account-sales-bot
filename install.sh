@@ -24,25 +24,25 @@ die() {
 
 require_root() {
   if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
-    die "این نصب‌کننده باید با sudo یا کاربر root اجرا شود."
+    die "Run this installer with sudo or as root."
   fi
 }
 
 require_supported_os() {
-  [[ -r /etc/os-release ]] || die "فایل /etc/os-release پیدا نشد."
+  [[ -r /etc/os-release ]] || die "/etc/os-release was not found."
   # shellcheck disable=SC1091
   source /etc/os-release
   [[ "${ID:-}" == "ubuntu" ]] \
-    || die "این نصب‌کننده فقط برای Ubuntu آماده شده است (سیستم فعلی: ${ID:-unknown})."
+    || die "This installer supports Ubuntu only (detected: ${ID:-unknown})."
   local major="${VERSION_ID%%.*}"
   [[ "$major" =~ ^[0-9]+$ ]] && ((major >= 22)) \
-    || die "حداقل Ubuntu 22.04 لازم است (نسخه فعلی: ${VERSION_ID:-unknown})."
+    || die "Ubuntu 22.04 or newer is required (detected: ${VERSION_ID:-unknown})."
   command -v systemctl >/dev/null 2>&1 \
-    || die "systemd روی این سیستم در دسترس نیست."
+    || die "systemd is not available on this system."
 }
 
 install_dependencies() {
-  log "نصب وابستگی‌های Ubuntu و Python"
+  log "Installing Ubuntu and Python dependencies"
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
   apt-get install -y \
@@ -68,24 +68,24 @@ env_value() {
 validate_token() {
   local value="$1"
   [[ "$value" =~ ^[0-9]+:[A-Za-z0-9_-]{20,}$ ]] \
-    || die "فرمت BOT_TOKEN معتبر نیست."
+    || die "BOT_TOKEN format is invalid."
 }
 
 validate_admin_id() {
   local value="$1"
   [[ "$value" =~ ^[1-9][0-9]{0,18}$ ]] \
-    || die "ADMIN_IDS باید یک Telegram ID عددی مثبت باشد."
+    || die "ADMIN_IDS must be a positive numeric Telegram ID."
   if ((${#value} == 19)) && [[ "$value" > "9223372036854775807" ]]; then
-    die "ADMIN_IDS از محدوده عددی پشتیبانی‌شده بزرگ‌تر است."
+    die "ADMIN_IDS is outside the supported numeric range."
   fi
 }
 
 verify_telegram_token() {
   local value="$1"
-  log "بررسی BOT_TOKEN از طریق Telegram"
+  log "Verifying BOT_TOKEN with Telegram"
   if ! printf 'silent\nshow-error\nfail\nmax-time = 15\nurl = "https://api.telegram.org/bot%s/getMe"\n' "$value" \
       | curl --config - >/dev/null; then
-    die "توکن توسط Telegram تأیید نشد یا اتصال به api.telegram.org برقرار نیست."
+    die "Telegram did not accept the token, or api.telegram.org is unreachable."
   fi
 }
 
@@ -109,21 +109,20 @@ create_or_load_config() {
     validate_token "$BOT_TOKEN_VALUE"
     validate_admin_id "$ADMIN_ID_VALUE"
     chmod 0600 "$ENV_FILE"
-    log "تنظیمات موجود از $ENV_FILE حفظ شد"
+    log "Existing configuration preserved: $ENV_FILE"
     return
   fi
 
-  [[ -r /dev/tty ]] || die "برای نصب اولیه یک ترمینال تعاملی لازم است."
+  [[ -r /dev/tty ]] || die "Initial installation requires an interactive terminal."
 
   BOT_TOKEN_VALUE="${ACCOUNT_SALES_BOT_TOKEN:-}"
   ADMIN_ID_VALUE="${ACCOUNT_SALES_BOT_ADMIN_ID:-}"
 
   if [[ -z "$BOT_TOKEN_VALUE" ]]; then
-    read -r -s -p "BOT_TOKEN را وارد کنید: " BOT_TOKEN_VALUE </dev/tty
-    printf '\n' >/dev/tty
+    read -r -p "Enter BOT_TOKEN: " BOT_TOKEN_VALUE </dev/tty
   fi
   if [[ -z "$ADMIN_ID_VALUE" ]]; then
-    read -r -p "Telegram ID عددی مدیر اصلی را وارد کنید: " ADMIN_ID_VALUE </dev/tty
+    read -r -p "Enter numeric Telegram ID for the root admin: " ADMIN_ID_VALUE </dev/tty
   fi
 
   validate_token "$BOT_TOKEN_VALUE"
@@ -136,15 +135,15 @@ create_or_load_config() {
     printf 'DATA_DIR=%s\n' "$DATA_DIR"
   } >"$ENV_FILE"
   chmod 0600 "$ENV_FILE"
-  log "فایل امن تنظیمات ساخته شد: $ENV_FILE"
+  log "Configuration file created: $ENV_FILE"
 }
 
 sync_source() {
   install -d -m 0755 "$(dirname "$INSTALL_DIR")"
   if [[ -d "$INSTALL_DIR/.git" ]]; then
-    log "دریافت آخرین نسخه از GitHub"
+    log "Downloading the latest source from GitHub"
     if [[ -n "$(git -C "$INSTALL_DIR" status --porcelain)" ]]; then
-      die "داخل $INSTALL_DIR تغییر محلی وجود دارد؛ ابتدا آن را commit یا پاک‌سازی کنید."
+      die "Local changes exist in $INSTALL_DIR. Commit or remove them before updating."
     fi
     git -C "$INSTALL_DIR" fetch --prune origin
     git -C "$INSTALL_DIR" checkout -q "$REPOSITORY_REF"
@@ -154,10 +153,10 @@ sync_source() {
 
   if [[ -e "$INSTALL_DIR" ]] \
       && [[ -n "$(find "$INSTALL_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
-    die "مسیر $INSTALL_DIR خالی نیست و Git repository معتبر هم نیست."
+    die "$INSTALL_DIR is not empty and is not a valid Git repository."
   fi
   rmdir "$INSTALL_DIR" 2>/dev/null || true
-  log "دریافت سورس از GitHub"
+  log "Cloning source from GitHub"
   git clone --depth 1 --branch "$REPOSITORY_REF" "$REPOSITORY_URL" "$INSTALL_DIR"
 }
 
@@ -165,16 +164,16 @@ install_python_runtime() {
   local version
   version="$(tr -d '\r\n ' <"$INSTALL_DIR/VERSION")"
   [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
-    || die "مقدار VERSION معتبر نیست: $version"
+    || die "Invalid VERSION value: $version"
 
-  log "ساخت محیط Python نسخه $version"
+  log "Preparing Python environment for version $version"
   if [[ ! -x "$VENV_DIR/bin/python" ]]; then
     python3 -m venv "$VENV_DIR"
   fi
   "$VENV_DIR/bin/python" -m pip install --disable-pip-version-check --upgrade pip
   "$VENV_DIR/bin/python" -m pip install --disable-pip-version-check -r "$INSTALL_DIR/requirements.txt"
 
-  log "اجرای compile gate"
+  log "Running compile checks"
   "$VENV_DIR/bin/python" -m compileall -q "$INSTALL_DIR"
   "$VENV_DIR/bin/python" -m py_compile \
     "$INSTALL_DIR/bot.py" \
@@ -224,28 +223,28 @@ EOF
   install -m 0644 "$unit_tmp" "$SERVICE_FILE"
   rm -f "$unit_tmp"
 
-  log "راه‌اندازی سرویس systemd"
+  log "Starting the systemd service"
   systemctl daemon-reload
   systemctl enable "$SERVICE_NAME" >/dev/null
   systemctl restart "$SERVICE_NAME"
   sleep 3
   if ! systemctl is-active --quiet "$SERVICE_NAME"; then
     journalctl -u "$SERVICE_NAME" -n 100 --no-pager >&2 || true
-    die "سرویس اجرا نشد."
+    die "The service failed to start."
   fi
 }
 
 print_summary() {
   local version
   version="$(tr -d '\r\n ' <"$INSTALL_DIR/VERSION")"
-  printf '\nنصب با موفقیت انجام شد.\n'
+  printf '\nInstallation completed successfully.\n'
   printf 'Version: %s\n' "$version"
   printf 'Source:  %s\n' "$INSTALL_DIR"
   printf 'Config:  %s\n' "$ENV_FILE"
   printf 'Data:    %s\n' "$DATA_DIR"
   printf 'Status:  systemctl status %s\n' "$SERVICE_NAME"
   printf 'Logs:    journalctl -u %s -f\n' "$SERVICE_NAME"
-  printf '\nاکنون در تلگرام /start را بزنید و تنظیمات سرویس‌ها را از پنل مدیر تکمیل کنید.\n'
+  printf '\nOpen the bot in Telegram, send /start, and complete the service settings in the admin panel.\n'
 }
 
 main() {

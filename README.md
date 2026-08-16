@@ -19,6 +19,19 @@
 
 ## نصب روی Ubuntu 22.04 یا جدیدتر
 
+ابتدا پیش‌نیازهای نصب را آماده کنید:
+
+<div dir="ltr" align="left">
+
+```bash
+sudo apt update
+sudo apt install -y curl ca-certificates
+```
+
+</div>
+
+سپس نصب‌کننده را اجرا کنید:
+
 <div dir="ltr" align="left">
 
 ```bash

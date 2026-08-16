@@ -1,4 +1,5 @@
 import unittest
+import re
 from pathlib import Path
 
 
@@ -26,6 +27,10 @@ class PublicReleaseTests(unittest.TestCase):
         self.assertIn("/var/lib/account-sales-bot", installer)
         self.assertIn("https://github.com/peyley95/account-sales-bot.git", installer)
         self.assertIn('chmod 0600 "$ENV_FILE"', installer)
+        self.assertIn("Enter BOT_TOKEN:", installer)
+        self.assertIn("Enter numeric Telegram ID for the root admin:", installer)
+        self.assertNotIn("read -r -s", installer)
+        self.assertIsNone(re.search(r"[\u0600-\u06FF]", installer))
         self.assertNotIn("docker", installer.lower())
         self.assertNotIn("set -x", installer)
 
@@ -62,6 +67,8 @@ class PublicReleaseTests(unittest.TestCase):
         self.assertIn("صفر تا صد این ربات", readme)
         self.assertIn("Codex", readme)
         self.assertIn("ChatGPT", readme)
+        self.assertIn("sudo apt update", readme)
+        self.assertIn("sudo apt install -y curl ca-certificates", readme)
         self.assertIn("https://raw.githubusercontent.com/peyley95/account-sales-bot/main/install.sh", readme)
         self.assertLess(len(readme), 5000)
 
