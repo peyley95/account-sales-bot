@@ -42,19 +42,7 @@ curl -fsSL https://raw.githubusercontent.com/peyley95/account-sales-bot/main/ins
 
 نصب‌کننده توکن ربات و Telegram ID عددی مدیر اصلی را دریافت می‌کند و سرویس را با systemd راه‌اندازی می‌کند. بعد از نصب، در تلگرام `/start` را بزنید و اتصال سرویس‌ها، درگاه‌های پرداخت و بسته‌ها را از پنل ادمین تنظیم کنید.
 
-## مدیریت سرویس
-
-<div dir="ltr" align="left">
-
-```bash
-sudo systemctl status account-sales-bot
-sudo systemctl restart account-sales-bot
-sudo journalctl -u account-sales-bot -f
-```
-
-</div>
-
-به‌روزرسانی:
+## به‌روزرسانی
 
 <div dir="ltr" align="left">
 
@@ -71,5 +59,38 @@ sudo bash /opt/account-sales-bot/update.sh
 صفر تا صد این ربات، از طراحی و کدنویسی تا تست و مستندسازی، با Codex در ChatGPT ساخته شده است.
 
 این پروژه با مجوز [MIT](LICENSE) منتشر می‌شود.
+
+## توقف و اجرای مجدد ربات
+
+<div dir="ltr" align="left">
+
+```bash
+sudo systemctl stop account-sales-bot
+sudo systemctl start account-sales-bot
+sudo systemctl restart account-sales-bot
+sudo systemctl status account-sales-bot --no-pager
+sudo journalctl -u account-sales-bot -f
+```
+
+</div>
+
+## حذف کامل ربات از سرور
+
+هشدار: دستورهای زیر سرویس، سورس، تنظیمات، دیتابیس و تمام بکاپ‌های ربات را برای همیشه حذف می‌کنند. قبل از اجرا، در صورت نیاز از مسیر `/var/lib/account-sales-bot` بکاپ بگیرید.
+
+<div dir="ltr" align="left">
+
+```bash
+sudo systemctl disable --now account-sales-bot
+sudo rm -f /etc/systemd/system/account-sales-bot.service
+sudo systemctl daemon-reload
+sudo systemctl reset-failed
+sudo userdel accountbot 2>/dev/null || true
+sudo rm -rf /opt/account-sales-bot
+sudo rm -rf /etc/account-sales-bot
+sudo rm -rf /var/lib/account-sales-bot
+```
+
+</div>
 
 </div>

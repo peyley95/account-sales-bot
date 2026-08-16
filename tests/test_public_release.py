@@ -70,6 +70,10 @@ class PublicReleaseTests(unittest.TestCase):
         self.assertIn("sudo apt update", readme)
         self.assertIn("sudo apt install -y curl ca-certificates", readme)
         self.assertIn("https://raw.githubusercontent.com/peyley95/account-sales-bot/main/install.sh", readme)
+        self.assertIn("sudo systemctl stop account-sales-bot", readme)
+        self.assertIn("sudo systemctl start account-sales-bot", readme)
+        self.assertIn("sudo systemctl disable --now account-sales-bot", readme)
+        self.assertIn("sudo rm -rf /var/lib/account-sales-bot", readme)
         self.assertLess(len(readme), 5000)
 
     def test_example_env_is_bootstrap_only(self):
