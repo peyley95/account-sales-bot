@@ -1986,6 +1986,7 @@ APP_SETTINGS_MIGRATION_VERSION = "3.2.1"
 _SALES_SETTINGS_V34_MIGRATION_KEY = "app_sales_settings_v34_initialized"
 _PAYMENT_SETTINGS_V35_MIGRATION_KEY = "app_payment_settings_v35_initialized"
 RESELLERS_V36_MIGRATION_KEY = "resellers_v36_migrated"
+FEATURE_TOGGLES_V100_MIGRATION_KEY = "feature_toggles_v100_initialized"
 _APP_SETTING_KEYS = {
     "bot_brand_name",
     "account_username_prefix",
@@ -2014,6 +2015,8 @@ _APP_SETTING_KEYS = {
     "card_transfer_card_holder",
     "openvpn_sales_enabled",
     "v2ray_sales_enabled",
+    "referral_enabled",
+    "wallet_enabled",
 }
 _SECRET_APP_SETTING_KEYS = {"api_pass", "xui_api_token", "card_transfer_card_number"}
 
@@ -2197,6 +2200,41 @@ def initialize_v35_payment_settings(defaults: dict | None = None) -> dict:
         return _app_settings_state_from_conn(conn)
 
 
+def initialize_feature_toggles(defaults: dict | None = None) -> dict:
+    """Persist referral/wallet switches without changing existing data.
+
+    Both features default to enabled so upgrading an existing installation
+    preserves its established behavior. INSERT OR IGNORE also makes the
+    migration safe to repeat and keeps every prior Admin choice authoritative.
+    """
+    supplied = dict(defaults or {})
+    values = {
+        "referral_enabled": bool(supplied.get("referral_enabled", True)),
+        "wallet_enabled": bool(supplied.get("wallet_enabled", True)),
+    }
+    with _tx(immediate=True) as conn:
+        marker = conn.execute(
+            "SELECT value FROM meta WHERE key=?",
+            (FEATURE_TOGGLES_V100_MIGRATION_KEY,),
+        ).fetchone()
+        if not marker:
+            ts = now_iso()
+            for key, value in values.items():
+                conn.execute(
+                    "INSERT OR IGNORE INTO app_settings(key,value_json,updated_at) VALUES(?,?,?)",
+                    (key, _json_dumps(value), ts),
+                )
+            conn.execute(
+                "INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)",
+                (FEATURE_TOGGLES_V100_MIGRATION_KEY, "1.0.0"),
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO meta(key,value) VALUES('feature_toggles_v100_initialized_at',?)",
+                (ts,),
+            )
+        return _app_settings_state_from_conn(conn)
+
+
 def initialize_v36_resellers(*, root_admin_id: int = 0, env_admin_ids=()) -> dict:
     """One-time conversion of former dynamic Admin IDs into resellers.
 
@@ -2258,36 +2296,42 @@ def app_settings_migration_version() -> str:
         conn.close()
 
 
-def set_app_setting(key: str, value, *, admin_tg_id: int = 0) -> dict:
-    key = str(key or "").strip()
-    if key not in _APP_SETTING_KEYS:
+def set_app_settings(values: dict, *, admin_tg_id: int = 0) -> dict:
+    """Commit one or more settings and their audit rows atomically."""
+    clean = {str(key or "").strip(): value for key, value in dict(values or {}).items()}
+    if not clean or any(key not in _APP_SETTING_KEYS for key in clean):
         raise ValueError("تنظیم درخواستی قابل ذخیره نیست")
     with _tx(immediate=True) as conn:
-        before_row = conn.execute(
-            "SELECT value_json FROM app_settings WHERE key=?", (key,)
-        ).fetchone()
-        before = _json_loads(before_row[0], None) if before_row else None
         ts = now_iso()
-        conn.execute(
-            """INSERT INTO app_settings(key,value_json,updated_at) VALUES(?,?,?)
-               ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at""",
-            (key, _json_dumps(value), ts),
-        )
-        if admin_tg_id and before != value:
-            if key in _SECRET_APP_SETTING_KEYS:
-                before_json = after_json = _json_dumps({})
-            else:
-                before_json = _json_dumps({"value": before})
-                after_json = _json_dumps({"value": value})
+        for key, value in clean.items():
+            before_row = conn.execute(
+                "SELECT value_json FROM app_settings WHERE key=?", (key,)
+            ).fetchone()
+            before = _json_loads(before_row[0], None) if before_row else None
             conn.execute(
-                """INSERT INTO admin_audit(admin_tg_id,target_tg_id,action,before_json,after_json,meta_json,created_at)
-                   VALUES(?,?,?,?,?,?,?)""",
-                (
-                    int(admin_tg_id), 0, f"{key.upper()} updated",
-                    before_json, after_json, _json_dumps({"setting": key}), ts,
-                ),
+                """INSERT INTO app_settings(key,value_json,updated_at) VALUES(?,?,?)
+                   ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at""",
+                (key, _json_dumps(value), ts),
             )
+            if admin_tg_id and before != value:
+                if key in _SECRET_APP_SETTING_KEYS:
+                    before_json = after_json = _json_dumps({})
+                else:
+                    before_json = _json_dumps({"value": before})
+                    after_json = _json_dumps({"value": value})
+                conn.execute(
+                    """INSERT INTO admin_audit(admin_tg_id,target_tg_id,action,before_json,after_json,meta_json,created_at)
+                       VALUES(?,?,?,?,?,?,?)""",
+                    (
+                        int(admin_tg_id), 0, f"{key.upper()} updated",
+                        before_json, after_json, _json_dumps({"setting": key}), ts,
+                    ),
+                )
         return _app_settings_state_from_conn(conn)
+
+
+def set_app_setting(key: str, value, *, admin_tg_id: int = 0) -> dict:
+    return set_app_settings({key: value}, admin_tg_id=admin_tg_id)
 
 
 # -------------------- v3.6 resellers and debt ledger --------------------

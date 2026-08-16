@@ -22,13 +22,14 @@ from storage import (
     delete_xui_inbound as _db_delete_xui_inbound,
     get_app_settings_state,
     initialize_app_settings,
+    initialize_feature_toggles,
     initialize_v34_sales_settings,
     initialize_v35_payment_settings,
     initialize_v36_resellers,
     record_reseller_debt_charge as _db_record_reseller_debt_charge,
     rename_xui_inbound as _db_rename_xui_inbound,
     set_reseller_debt as _db_set_reseller_debt,
-    set_app_setting as _db_set_app_setting,
+    set_app_settings as _db_set_app_settings,
     update_reseller as _db_update_reseller,
 )
 
@@ -41,6 +42,8 @@ DEFAULTS = MappingProxyType({
     "bot_brand_name": "Account Sales Bot",
     "account_username_prefix": "accountbot",
     "referral_code_prefix": "ASB",
+    "referral_enabled": True,
+    "wallet_enabled": True,
     "openvpn_connections_url": "0",
     "openvpn_sales_enabled": True,
     "api_ip": "127.0.0.1",
@@ -196,6 +199,7 @@ def normalize_setting(key: str, value, *, from_env: bool = False):
         "xui_verify_tls", "zarinpal_sandbox",
         "openvpn_sales_enabled", "v2ray_sales_enabled",
         "zarinpal_enabled", "card_transfer_enabled",
+        "referral_enabled", "wallet_enabled",
     }:
         return _bool_value(value, strict=not from_env)
     if key == "xui_sub_public_base":
@@ -248,6 +252,8 @@ def build_migration_seed(source: Mapping | None = None) -> dict:
         "bot_brand_name": _env_get(source, "BOT_BRAND_NAME", DEFAULTS["bot_brand_name"]),
         "account_username_prefix": _env_get(source, "ACCOUNT_USERNAME_PREFIX", DEFAULTS["account_username_prefix"]),
         "referral_code_prefix": _env_get(source, "REFERRAL_CODE_PREFIX", DEFAULTS["referral_code_prefix"]),
+        "referral_enabled": DEFAULTS["referral_enabled"],
+        "wallet_enabled": DEFAULTS["wallet_enabled"],
         "openvpn_connections_url": openvpn_url,
         "openvpn_sales_enabled": DEFAULTS["openvpn_sales_enabled"],
         "api_ip": api_ip,
@@ -398,6 +404,7 @@ def initialize_runtime_settings(
                 root_admin_id=root,
                 env_admin_ids=tuple(x for x in ids if int(x) != root),
             )
+            state = initialize_feature_toggles(DEFAULTS)
             return APP_SETTINGS.replace(state, root_admin_id=root)
         seed = build_migration_seed(source)
         remarks = (
@@ -416,6 +423,7 @@ def initialize_runtime_settings(
             root_admin_id=root,
             env_admin_ids=tuple(x for x in ids if int(x) != root),
         )
+        state = initialize_feature_toggles(DEFAULTS)
         return APP_SETTINGS.replace(state, root_admin_id=root)
 
 
@@ -489,8 +497,33 @@ def update_setting(key: str, value, *, admin_tg_id: int = 0) -> Mapping:
                 raise ValueError("ابتدا شماره کارت را تنظیم کنید")
             if not str(APP_SETTINGS.get("card_transfer_card_holder", "") or "").strip():
                 raise ValueError("ابتدا نام صاحب کارت را تنظیم کنید")
-        state = _db_set_app_setting(key, normalized, admin_tg_id=int(admin_tg_id or 0))
+        if key == "wallet_enabled" and not normalized:
+            if bool(APP_SETTINGS.get("referral_enabled", True)):
+                raise ValueError("تا وقتی Referral فعال است، کیف پول نمی‌تواند غیرفعال شود")
+        updates = {key: normalized}
+        if key == "referral_enabled" and normalized:
+            # Referral rewards are paid into the wallet. Enabling Referral must
+            # therefore enable both settings in one SQLite transaction and one
+            # immutable snapshot replacement.
+            updates["wallet_enabled"] = True
+        state = _db_set_app_settings(updates, admin_tg_id=int(admin_tg_id or 0))
         return APP_SETTINGS.replace(state, root_admin_id=root_admin_id())
+
+
+def referral_enabled() -> bool:
+    return bool(APP_SETTINGS.get("referral_enabled", True))
+
+
+def wallet_enabled() -> bool:
+    return bool(APP_SETTINGS.get("wallet_enabled", True))
+
+
+def set_referral_enabled(enabled: bool, *, admin_tg_id: int = 0) -> Mapping:
+    return update_setting("referral_enabled", bool(enabled), admin_tg_id=admin_tg_id)
+
+
+def set_wallet_enabled(enabled: bool, *, admin_tg_id: int = 0) -> Mapping:
+    return update_setting("wallet_enabled", bool(enabled), admin_tg_id=admin_tg_id)
 
 
 def service_sales_enabled(service: str) -> bool:

@@ -34,6 +34,13 @@ class PublicReleaseTests(unittest.TestCase):
         self.assertNotIn("docker", installer.lower())
         self.assertNotIn("set -x", installer)
 
+    def test_all_shell_output_is_english_only(self):
+        shell_files = [ROOT / "install.sh", ROOT / "update.sh", ROOT / "scripts/validate.sh"]
+        for path in shell_files:
+            content = path.read_text(encoding="utf-8")
+            self.assertIsNone(re.search(r"[\u0600-\u06FF]", content), path.name)
+        self.assertIn("Starting Account Sales Bot update", shell_files[1].read_text(encoding="utf-8"))
+
     def test_container_artifacts_are_not_published(self):
         for relative in (
             "Dockerfile", "compose.yaml", "entrypoint.sh", ".dockerignore",

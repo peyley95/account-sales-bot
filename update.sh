@@ -3,6 +3,8 @@ set -Eeuo pipefail
 
 INSTALLER="/opt/account-sales-bot/install.sh"
 
+printf 'Starting Account Sales Bot update...\n'
+
 if [[ ! -f "$INSTALLER" ]]; then
   printf 'Installer not found: %s\n' "$INSTALLER" >&2
   exit 1

@@ -41,6 +41,7 @@ from app_settings import (
     reseller_records, root_admin_id, update_setting,
     enabled_sales_services, service_sales_enabled, set_service_sales_enabled,
     enabled_payment_gateways, payment_gateway_enabled, set_payment_gateway_enabled,
+    referral_enabled, wallet_enabled, set_referral_enabled, set_wallet_enabled,
 )
 from plans import (
     TEST_PLAN, price_rial, gb_to_bytes, plan_snapshot, plans_for, refresh_plans,
@@ -634,19 +635,13 @@ async def main_menu_keyboard(tg_id: int):
     if len(enabled) == 1:
         # With one sale service there is no redundant service-selection step.
         rows = list(service_menu_keyboard(enabled[0], tg_id).inline_keyboard[:-1])
-        rows.append([InlineKeyboardButton(
-            "📒 مشاهده بدهی" if reseller else "💰 کیف پول",
-            callback_data="menu|reseller_debt" if reseller else "menu|wallet",
-        )])
     else:
-        rows = [
-            [InlineKeyboardButton("🛍 انتخاب سرویس", callback_data="menu|services")],
-            [InlineKeyboardButton(
-                "📒 مشاهده بدهی" if reseller else "💰 کیف پول",
-                callback_data="menu|reseller_debt" if reseller else "menu|wallet",
-            )],
-        ]
-    if not reseller and await completed_purchase_for_menu(tg_id):
+        rows = [[InlineKeyboardButton("🛍 انتخاب سرویس", callback_data="menu|services")]]
+    if reseller:
+        rows.append([InlineKeyboardButton("📒 مشاهده بدهی", callback_data="menu|reseller_debt")])
+    elif wallet_enabled():
+        rows.append([InlineKeyboardButton("💰 کیف پول", callback_data="menu|wallet")])
+    if referral_enabled() and not reseller and await completed_purchase_for_menu(tg_id):
         rows.append([InlineKeyboardButton("🎁 دعوت دوستان و دریافت اکانت رایگان", callback_data="menu|referral")])
     if is_admin(tg_id):
         rows.append([InlineKeyboardButton("⚙️ پنل مدیریت", callback_data="admin_tools")])
@@ -1522,6 +1517,7 @@ def admin_settings_menu_keyboard(maintenance: bool, backup_enabled: bool):
         [InlineKeyboardButton("🟣 تنظیمات ثنایی", callback_data="admin_cfg|xui")],
         [InlineKeyboardButton("💳 درگاه‌های پرداخت", callback_data="admin_gateways")],
         [InlineKeyboardButton("🎁 تنظیمات Referral", callback_data="admin_referral_settings")],
+        [InlineKeyboardButton("💰 تنظیمات کیف پول", callback_data="admin_wallet_settings")],
         [InlineKeyboardButton(
             "💾 تنظیمات بکاپ" + (" ✅" if backup_enabled else " ❌"),
             callback_data="admin_backup_settings",
@@ -2128,16 +2124,48 @@ async def show_admin_referral_settings(message, admin_tg_id: int):
         return
     discount = current_referral_discount_percent()
     reward = current_referral_reward_percent()
+    enabled = referral_enabled()
     await message.edit_text(
         "🎁 <b>تنظیمات Referral</b>\n\n"
+        f"وضعیت: <b>{'فعال ✅' if enabled else 'غیرفعال ⛔'}</b>\n"
         f"پاداش خریدار / تخفیف خرید اول: <b>{discount}%</b>\n"
         f"پاداش معرف: <b>{reward}%</b>\n\n"
-        "تغییرات از این بخش در دیتابیس ذخیره می‌شوند و بعد از Restart کانتینر نیز باقی می‌مانند.",
+        "در حالت غیرفعال، کد معرف و پیام تخفیف خرید اول به کاربران نمایش داده نمی‌شود.",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                "⛔ غیرفعال‌کردن Referral" if enabled else "✅ فعال‌کردن Referral",
+                callback_data="admin_feature_toggle|referral",
+            )],
             [InlineKeyboardButton("✏️ درصد پاداش خریدار", callback_data="admin_referral_edit|discount")],
             [InlineKeyboardButton("✏️ درصد پاداش معرف", callback_data="admin_referral_edit|reward")],
             [InlineKeyboardButton("📊 گزارش Referral", callback_data="admin_referral_report")],
+            [InlineKeyboardButton("🔙 تنظیمات", callback_data="admin_settings_menu")],
+        ]),
+    )
+
+
+async def show_admin_wallet_settings(message, admin_tg_id: int):
+    if not is_admin(admin_tg_id):
+        return
+    enabled = wallet_enabled()
+    referral_is_enabled = referral_enabled()
+    dependency = (
+        "\n\n⚠️ تا وقتی Referral فعال است، کیف پول نمی‌تواند غیرفعال شود."
+        if referral_is_enabled else ""
+    )
+    await message.edit_text(
+        "💰 <b>تنظیمات کیف پول</b>\n\n"
+        f"وضعیت: <b>{'فعال ✅' if enabled else 'غیرفعال ⛔'}</b>"
+        f"{dependency}",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                "⛔ غیرفعال‌کردن کیف پول" if enabled else "✅ فعال‌کردن کیف پول",
+                callback_data="admin_feature_toggle|wallet",
+            )],
+            [InlineKeyboardButton("👤 مدیریت کیف پول کاربران", callback_data="admin_wallet_manage")],
+            [InlineKeyboardButton("💰 کیف پول‌های دارای موجودی", callback_data="admin_wallet_pos|0")],
             [InlineKeyboardButton("🔙 تنظیمات", callback_data="admin_settings_menu")],
         ]),
     )
@@ -2721,6 +2749,12 @@ async def show_wallet(message, tg_id: int):
     if is_reseller(tg_id):
         await show_reseller_debt(message, tg_id)
         return
+    if not wallet_enabled():
+        await message.edit_text(
+            "⛔ قابلیت کیف پول در حال حاضر غیرفعال است.",
+            reply_markup=await main_menu_keyboard(tg_id),
+        )
+        return
     balance, reserved, latest = await asyncio.gather(
         run_blocking(wallet_balance, tg_id),
         run_blocking(reserved_wallet_for_user, tg_id),
@@ -2736,7 +2770,9 @@ async def show_wallet(message, tg_id: int):
         text += f"رزرو سفارش‌های در انتظار: <b>{reserved:,} تومان</b>\nموجودی قابل استفاده: <b>{available:,} تومان</b>\n"
     if pending and not reserved:
         text += "سفارش در حال تکمیل: <b>۱ مورد</b>\n"
-    text += "\nکیف پول امکان شارژ دستی ندارد و اعتبار آن فقط از طریق دعوت دوستان اضافه می‌شود."
+    text += "\nکیف پول امکان شارژ دستی توسط کاربر ندارد."
+    if referral_enabled():
+        text += " اعتبار آن از طریق دعوت دوستان اضافه می‌شود."
     if pending:
         markup = InlineKeyboardMarkup([
             [InlineKeyboardButton(
@@ -2754,6 +2790,12 @@ async def show_wallet(message, tg_id: int):
 async def show_referral(message, tg_id: int):
     if is_reseller(tg_id):
         await show_reseller_debt(message, tg_id)
+        return
+    if not referral_enabled():
+        await message.edit_text(
+            "⛔ قابلیت Referral در حال حاضر غیرفعال است.",
+            reply_markup=await main_menu_keyboard(tg_id),
+        )
         return
     if not (await run_blocking(has_completed_purchase, tg_id)):
         await message.edit_text(
@@ -2976,6 +3018,38 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             context.user_data.clear()
             await show_admin_settings_menu(q.message, q.from_user.id)
+            return
+
+        if data == "admin_wallet_settings":
+            if not is_admin(q.from_user.id):
+                return
+            context.user_data.pop("awaiting", None)
+            await show_admin_wallet_settings(q.message, q.from_user.id)
+            return
+
+        if parts[0] == "admin_feature_toggle" and len(parts) == 2:
+            if not is_admin(q.from_user.id):
+                return
+            feature = parts[1]
+            if feature not in {"referral", "wallet"}:
+                return
+            try:
+                if feature == "referral":
+                    await run_blocking(
+                        set_referral_enabled, not referral_enabled(),
+                        admin_tg_id=q.from_user.id, _lane="db",
+                    )
+                    await show_admin_referral_settings(q.message, q.from_user.id)
+                else:
+                    await run_blocking(
+                        set_wallet_enabled, not wallet_enabled(),
+                        admin_tg_id=q.from_user.id, _lane="db",
+                    )
+                    await show_admin_wallet_settings(q.message, q.from_user.id)
+            except ValueError as exc:
+                await safe_callback_answer(q, str(exc), show_alert=True)
+                if feature == "wallet":
+                    await show_admin_wallet_settings(q.message, q.from_user.id)
             return
 
         if data == "admin_gateways":
@@ -4548,6 +4622,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if (
                 action == "buy"
+                and referral_enabled()
                 and not is_admin(q.from_user.id)
                 and not is_reseller(q.from_user.id)
                 and not (await run_blocking(has_completed_purchase, q.from_user.id))
@@ -4600,6 +4675,15 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context.user_data.pop("awaiting", None)
                 await safe_callback_answer(q, "Referral برای ریسلر فعال نیست.", show_alert=True)
                 await show_reseller_debt(q.message, q.from_user.id)
+                return
+            if not referral_enabled():
+                context.user_data.pop("first_buy_order", None)
+                context.user_data.pop("awaiting", None)
+                await safe_callback_answer(q, "Referral غیرفعال است.", show_alert=True)
+                await q.message.edit_text(
+                    "⛔ قابلیت Referral در حال حاضر غیرفعال است. لطفاً بسته را دوباره انتخاب کنید.",
+                    reply_markup=await main_menu_keyboard(q.from_user.id),
+                )
                 return
             order = context.user_data.get("first_buy_order") or {}
             if not order:
@@ -5505,6 +5589,13 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     reply_markup=await main_menu_keyboard(tg_id),
                 )
                 return
+            if not referral_enabled():
+                context.user_data.pop("first_buy_order", None)
+                await update.message.reply_text(
+                    "⛔ قابلیت Referral در حال حاضر غیرفعال است. لطفاً بسته را دوباره انتخاب کنید.",
+                    reply_markup=await main_menu_keyboard(tg_id),
+                )
+                return
             if (await run_blocking(has_completed_purchase, tg_id)) or (await run_blocking(referral_already_used, tg_id)):
                 await update.message.reply_text(
                     "⚠️ تخفیف معرف فقط برای اولین خرید قابل استفاده است.",
@@ -6047,15 +6138,19 @@ async def order_price_breakdown(
     tg_id: int, plan_key: str, *, service: str = "openvpn", referral_code: str = ""
 ) -> dict:
     base_price = int(plans_for(service)[plan_key]["price_toman"])
-    discount_percent = current_referral_discount_percent()
-    referral_discount = (base_price * discount_percent) // 100 if referral_code else 0
+    referral_is_enabled = referral_enabled()
+    discount_percent = current_referral_discount_percent() if referral_is_enabled else 0
+    referral_discount = (
+        (base_price * discount_percent) // 100
+        if referral_is_enabled and referral_code else 0
+    )
     after_discount = max(base_price - referral_discount, 0)
-    available = await run_blocking(wallet_available, tg_id)
+    available = await run_blocking(wallet_available, tg_id) if wallet_enabled() else 0
     wallet_used = min(available, after_discount)
     gateway_toman = max(after_discount - wallet_used, 0)
     return {
         "base_price_toman": base_price,
-        "referral_discount_percent": discount_percent if referral_code else 0,
+        "referral_discount_percent": discount_percent if referral_is_enabled and referral_code else 0,
         "referral_discount_toman": referral_discount,
         "after_discount_toman": after_discount,
         "wallet_used_toman": wallet_used,
@@ -6323,6 +6418,8 @@ async def start_order_message(message, context, tg_id: int, service: str, action
 
     # Referral discount is valid only on the first successful BUY, never renewal.
     if referral_code:
+        if not referral_enabled():
+            raise RuntimeError("قابلیت Referral در حال حاضر غیرفعال است")
         if not first_purchase or (await run_blocking(referral_already_used, tg_id)):
             raise RuntimeError("کد معرف فقط برای اولین خرید قابل استفاده است")
         actual_referrer = (await run_blocking(find_referrer_by_code, referral_code))

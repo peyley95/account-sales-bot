@@ -18,6 +18,7 @@ for test_file in \
   test_resellers.py \
   test_notifications.py \
   test_reseller_trials.py \
+  test_feature_toggles.py \
   test_public_release.py
 do
   python3 -m unittest discover -s tests -p "$test_file"
