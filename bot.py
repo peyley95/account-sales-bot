@@ -4,6 +4,7 @@ import hashlib
 import shutil
 import logging
 import math
+import re
 import time
 import secrets
 import functools
@@ -43,6 +44,7 @@ from app_settings import (
     enabled_payment_gateways, payment_gateway_enabled, set_payment_gateway_enabled,
     referral_enabled, wallet_enabled, set_referral_enabled, set_wallet_enabled,
 )
+from account_notifications import classify_openvpn_status, classify_v2ray_status
 from plans import (
     TEST_PLAN, price_rial, gb_to_bytes, plan_snapshot, plans_for, refresh_plans,
     refresh_test_plan, test_plan_enabled, pending_plan_is_stale, snapshot_for_delivery,
@@ -78,6 +80,9 @@ from storage import (
     mark_fulfillment_prepared, mark_fulfillment_remote_done,
     mark_fulfillment_provisioned, mark_fulfillment_completed,
     list_incomplete_fulfillments,
+    list_accounts_for_expiry_monitor,
+    claim_account_expiry_notification,
+    mark_account_expiry_notification_sent,
 )
 from services import mikrotik
 from services.xui import XUIClient
@@ -91,6 +96,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 logger = logging.getLogger("account-sales-bot")
 
 SERVICE_LABEL = {"openvpn": "OpenVPN", "v2ray": "V2Ray"}
+_ACCOUNT_EXPIRY_MONITOR_WAKE = None
 
 
 def welcome_text() -> str:
@@ -1551,6 +1557,11 @@ _ADMIN_CONFIG_FIELDS = {
     "userpre": ("account_username_prefix", "پیشوند نام اکانت", "bot"),
     "refpre": ("referral_code_prefix", "پیشوند کد Referral", "bot"),
     "ovpnurl": ("openvpn_connections_url", "لینک راهنمای OpenVPN", "bot"),
+    "expinterval": (
+        "account_expiry_check_interval_minutes",
+        "فاصله بررسی اکانت‌ها (دقیقه)",
+        "bot",
+    ),
     "mtip": ("api_ip", "Mikrotik IP", "mikrotik"),
     "mtport": ("api_port", "Mikrotik API Port", "mikrotik"),
     "mtuser": ("api_user", "Mikrotik Username", "mikrotik"),
@@ -1589,6 +1600,8 @@ async def show_admin_bot_settings(message, admin_tg_id: int):
         return
     snap = APP_SETTINGS.snapshot()
     openvpn_url = str(snap.get("openvpn_connections_url") or "0")
+    expiry_notifications = bool(snap.get("account_expiry_notifications_enabled", True))
+    expiry_interval = int(snap.get("account_expiry_check_interval_minutes") or 30)
     await message.edit_text(
         "🤖 <b>تنظیمات ربات</b>\n\n"
         f"نام برند: <code>{html.escape(str(snap.get('bot_brand_name') or ''))}</code>\n"
@@ -1596,7 +1609,9 @@ async def show_admin_bot_settings(message, admin_tg_id: int):
         f"پیشوند Referral: <code>{html.escape(str(snap.get('referral_code_prefix') or ''))}</code>\n"
         f"لینک OpenVPN: <code>{html.escape('Disabled' if openvpn_url == '0' else openvpn_url)}</code>\n"
         f"مدیر اصلی: <code>{root_admin_id()}</code>\n"
-        f"ریسلرهای فعال: <b>{len(reseller_records())}</b>",
+        f"ریسلرهای فعال: <b>{len(reseller_records())}</b>\n"
+        f"اعلان پایان اکانت: <b>{'فعال ✅' if expiry_notifications else 'غیرفعال ⛔'}</b>\n"
+        f"فاصله بررسی اکانت‌ها: <b>{expiry_interval} دقیقه</b>",
         parse_mode="HTML",
         disable_web_page_preview=True,
         reply_markup=InlineKeyboardMarkup([
@@ -1605,6 +1620,11 @@ async def show_admin_bot_settings(message, admin_tg_id: int):
             [InlineKeyboardButton("✏️ پیشوند نام اکانت", callback_data="admin_cfg_edit|userpre")],
             [InlineKeyboardButton("✏️ پیشوند کد Referral", callback_data="admin_cfg_edit|refpre")],
             [InlineKeyboardButton("✏️ لینک راهنمای OpenVPN", callback_data="admin_cfg_edit|ovpnurl")],
+            [InlineKeyboardButton(
+                f"اعلان پایان اکانت: {'فعال ✅' if expiry_notifications else 'غیرفعال ⛔'}",
+                callback_data="admin_account_expiry_toggle",
+            )],
+            [InlineKeyboardButton("✏️ فاصله بررسی اکانت‌ها", callback_data="admin_cfg_edit|expinterval")],
             [InlineKeyboardButton("🔙 تنظیمات", callback_data="admin_settings_menu")],
         ]),
     )
@@ -3088,6 +3108,18 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await show_admin_config_group(q.message, q.from_user.id, parts[1])
             return
 
+        if data == "admin_account_expiry_toggle":
+            if not is_admin(q.from_user.id):
+                return
+            desired = not bool(APP_SETTINGS.get("account_expiry_notifications_enabled", True))
+            await run_blocking(
+                update_setting, "account_expiry_notifications_enabled", desired,
+                admin_tg_id=q.from_user.id, _lane="db",
+            )
+            _wake_account_expiry_monitor()
+            await show_admin_bot_settings(q.message, q.from_user.id)
+            return
+
         if parts[0] == "admin_service_sales" and len(parts) == 2:
             if not is_admin(q.from_user.id):
                 return
@@ -3362,6 +3394,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "umpath": "مثال: um؛ اسلش‌های اضافی خودکار حذف می‌شوند.",
                 "cardnum": "شماره کارت 16 رقمی را وارد کنید؛ فاصله و خط تیره خودکار حذف می‌شود.",
                 "cardholder": "نامی را وارد کنید که باید کنار شماره کارت به کاربر نمایش داده شود.",
+                "expinterval": "یک عدد بین 5 تا 1440 دقیقه وارد کنید.",
             }
             await q.message.edit_text(
                 f"✏️ <b>{html.escape(label)}</b>\n\nمقدار جدید را ارسال کنید.\n{hints.get(short_key, '')}",
@@ -3395,6 +3428,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await run_blocking(
                 update_setting, key, pending["value"], admin_tg_id=q.from_user.id, _lane="db"
             )
+            if key == "account_expiry_check_interval_minutes":
+                _wake_account_expiry_monitor()
             context.user_data.pop("admin_config_edit", None)
             context.user_data.pop("awaiting", None)
             await show_admin_config_group(q.message, q.from_user.id, group)
@@ -7351,6 +7386,184 @@ async def _health_probe_loop():
         await asyncio.sleep(HEALTH_PROBE_INTERVAL_SECONDS)
 
 
+def _wake_account_expiry_monitor():
+    wake = _ACCOUNT_EXPIRY_MONITOR_WAKE
+    if wake is not None:
+        wake.set()
+
+
+def _openvpn_monitor_quota_bytes(account: dict, info: dict) -> int:
+    plan_key = str(account.get("plan_key") or "")
+    plan = plans_for("openvpn").get(plan_key) if plan_key else None
+    if plan:
+        return gb_to_bytes(int(plan.get("gb") or 0))
+    profile = str(info.get("profile") or account.get("profile") or "")
+    match = re.search(r"(\d+(?:\.\d+)?)\s*G(?:B)?", profile, re.IGNORECASE)
+    if not match:
+        return 0
+    return int(float(match.group(1)) * (1024 ** 3))
+
+
+def _account_expiry_notification_message(
+    service: str, identifier: str, assessment: dict
+) -> tuple[str, InlineKeyboardMarkup]:
+    label = SERVICE_LABEL.get(service, service)
+    safe_identifier = html.escape(str(identifier or ""))
+    if assessment.get("kind") == "expired":
+        text = (
+            f"⛔ <b>پایان اکانت {label}</b>\n\n"
+            f"اکانت <code>{safe_identifier}</code> به پایان رسیده است.\n"
+            "برای تمدید، دکمه زیر را بزنید."
+        )
+    else:
+        reasons = []
+        if assessment.get("low_volume"):
+            reasons.append("📦 ۱ گیگ یا کمتر از حجم اکانت باقی مانده است.")
+        if assessment.get("low_time"):
+            reasons.append("📅 ۱ روز یا کمتر از اعتبار اکانت باقی مانده است.")
+        text = (
+            f"⚠️ <b>یادآوری تمدید اکانت {label}</b>\n\n"
+            f"اکانت: <code>{safe_identifier}</code>\n"
+            + "\n".join(reasons)
+            + "\n\nبرای تمدید، دکمه زیر را بزنید."
+        )
+    ref = account_ref(identifier)
+    markup = InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "♻️ تمدید اکانت",
+            callback_data=f"myactref|renew|{service}|{ref}",
+        )
+    ]])
+    return text, markup
+
+
+async def _scan_one_account_for_expiry(application, account: dict) -> str:
+    if not bool(APP_SETTINGS.get("account_expiry_notifications_enabled", True)):
+        return "disabled"
+    account_id = int(account.get("account_id") or 0)
+    tg_id = int(account.get("tg_id") or 0)
+    service = str(account.get("service") or "")
+    identifier = str(account.get("identifier") or "")
+    cycle_key = str(account.get("updated_at") or "")
+    if account_id <= 0 or tg_id <= 0 or service not in SERVICE_LABEL or not identifier or not cycle_key:
+        return "invalid"
+
+    try:
+        if service == "openvpn":
+            info = await run_blocking_retry(
+                mikrotik.fetch_usage_and_expiry, identifier,
+                retries=0, _lane="mikrotik",
+            )
+            STATUS_CACHE.set((service, identifier), info, STATUS_CACHE_TTL_SECONDS)
+            assessment = classify_openvpn_status(
+                info,
+                quota_bytes=_openvpn_monitor_quota_bytes(account, info),
+            )
+        else:
+            status = await run_blocking_retry(
+                XUIClient().status, identifier,
+                retries=0, _lane="xui",
+            )
+            STATUS_CACHE.set((service, identifier), status, STATUS_CACHE_TTL_SECONDS)
+            assessment = classify_v2ray_status(status)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning(
+            "expiry monitor status failed account_id=%d service=%s error=%s",
+            account_id, service, type(exc).__name__,
+        )
+        return "status_error"
+
+    if not assessment:
+        return "healthy"
+    if not bool(APP_SETTINGS.get("account_expiry_notifications_enabled", True)):
+        return "disabled"
+    kind = str(assessment.get("kind") or "")
+    claimed = await run_blocking(
+        claim_account_expiry_notification,
+        account_id, kind, cycle_key,
+        _lane="db",
+    )
+    if not claimed:
+        return "duplicate_or_stale"
+
+    text, markup = _account_expiry_notification_message(service, identifier, assessment)
+    try:
+        await application.bot.send_message(
+            chat_id=tg_id,
+            text=text,
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        # The durable pre-send claim deliberately remains in place. This is an
+        # at-most-once notifier: an ambiguous Telegram timeout must never turn
+        # into the same message every thirty minutes.
+        logger.warning(
+            "expiry monitor Telegram send failed account_id=%d service=%s error=%s",
+            account_id, service, type(exc).__name__,
+        )
+        return "send_error"
+    await run_blocking(
+        mark_account_expiry_notification_sent,
+        account_id, kind, cycle_key,
+        _lane="db",
+    )
+    return kind
+
+
+async def _scan_account_service(application, accounts: list[dict]):
+    counts = {}
+    for account in accounts:
+        if not bool(APP_SETTINGS.get("account_expiry_notifications_enabled", True)):
+            break
+        result = await _scan_one_account_for_expiry(application, account)
+        counts[result] = int(counts.get(result, 0)) + 1
+        # Remote checks remain sequential per service. Yielding here keeps this
+        # low-priority background work cooperative with Telegram handlers.
+        await asyncio.sleep(0)
+    return counts
+
+
+async def _run_account_expiry_scan(application) -> dict:
+    accounts = await run_blocking(list_accounts_for_expiry_monitor, _lane="db")
+    by_service = {
+        service: [row for row in accounts if row.get("service") == service]
+        for service in ("openvpn", "v2ray")
+    }
+    openvpn_counts, v2ray_counts = await asyncio.gather(
+        _scan_account_service(application, by_service["openvpn"]),
+        _scan_account_service(application, by_service["v2ray"]),
+    )
+    result = {"accounts": len(accounts), "openvpn": openvpn_counts, "v2ray": v2ray_counts}
+    logger.info("account expiry monitor scan completed summary=%s", result)
+    return result
+
+
+async def _account_expiry_monitor_loop(application, wake: asyncio.Event):
+    while True:
+        try:
+            enabled = bool(APP_SETTINGS.get("account_expiry_notifications_enabled", True))
+            interval = int(APP_SETTINGS.get("account_expiry_check_interval_minutes", 30) or 30)
+            delay = max(interval, 5) * 60 if enabled else 3600
+            try:
+                await asyncio.wait_for(wake.wait(), timeout=delay)
+                wake.clear()
+                continue
+            except asyncio.TimeoutError:
+                pass
+            if bool(APP_SETTINGS.get("account_expiry_notifications_enabled", True)):
+                await _run_account_expiry_scan(application)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("account expiry monitor cycle failed: %s", exc)
+            await asyncio.sleep(60)
+
+
 def _backup_timezone():
     try:
         return ZoneInfo(APP_TIMEZONE)
@@ -7394,6 +7607,7 @@ async def _backup_loop():
 
 
 async def post_init(application):
+    global _ACCOUNT_EXPIRY_MONITOR_WAKE
     RUNTIME.heartbeat()
     if WATCHDOG_ENABLED:
         RUNTIME.start_watchdog(WATCHDOG_STALE_SECONDS, logger=logger)
@@ -7404,6 +7618,11 @@ async def post_init(application):
     # Always keep the lightweight scheduler task alive; the persistent admin
     # switch decides whether the 06:00 backup actually runs.
     tasks.append(asyncio.create_task(_backup_loop(), name="sqlite-backup"))
+    _ACCOUNT_EXPIRY_MONITOR_WAKE = asyncio.Event()
+    tasks.append(asyncio.create_task(
+        _account_expiry_monitor_loop(application, _ACCOUNT_EXPIRY_MONITOR_WAKE),
+        name="account-expiry-monitor",
+    ))
     for task in tasks:
         task.add_done_callback(
             lambda done: logger.error(
@@ -7414,7 +7633,7 @@ async def post_init(application):
         )
     application.bot_data["background_tasks"] = tasks
     logger.info(
-        "Account Sales Bot v1.0.0 runtime initialized watchdog=%s sqlite=%s cache_ttl=%.1fs workers=%d queue_cap=%d "
+        "Account Sales Bot v1.0.1 runtime initialized watchdog=%s sqlite=%s cache_ttl=%.1fs workers=%d queue_cap=%d "
         "lanes=misc:%d,db:%d,mikrotik:%d,xui:%d,zarinpal:%d read_deadline=%.1fs",
         WATCHDOG_ENABLED, (await run_blocking(database_stats)).get("quick_check"), STATUS_CACHE_TTL_SECONDS,
         BOT_CONCURRENT_UPDATES, BOT_UPDATE_QUEUE_CAP,
@@ -7424,11 +7643,13 @@ async def post_init(application):
 
 
 async def post_shutdown(application):
+    global _ACCOUNT_EXPIRY_MONITOR_WAKE
     RUNTIME.stop_watchdog()
     for task in application.bot_data.get("background_tasks", []):
         task.cancel()
     if application.bot_data.get("background_tasks"):
         await asyncio.gather(*application.bot_data["background_tasks"], return_exceptions=True)
+    _ACCOUNT_EXPIRY_MONITOR_WAKE = None
     for lane in BLOCKING_LANES.values():
         lane.shutdown()
 

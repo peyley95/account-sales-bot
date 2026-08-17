@@ -23,6 +23,7 @@ from storage import (
     get_app_settings_state,
     initialize_app_settings,
     initialize_feature_toggles,
+    initialize_v101_expiry_notifications,
     initialize_v34_sales_settings,
     initialize_v35_payment_settings,
     initialize_v36_resellers,
@@ -69,6 +70,8 @@ DEFAULTS = MappingProxyType({
     "card_transfer_enabled": False,
     "card_transfer_card_number": "",
     "card_transfer_card_holder": "",
+    "account_expiry_notifications_enabled": True,
+    "account_expiry_check_interval_minutes": 30,
 })
 
 def _bool_value(value, *, strict: bool = True) -> bool:
@@ -200,8 +203,17 @@ def normalize_setting(key: str, value, *, from_env: bool = False):
         "openvpn_sales_enabled", "v2ray_sales_enabled",
         "zarinpal_enabled", "card_transfer_enabled",
         "referral_enabled", "wallet_enabled",
+        "account_expiry_notifications_enabled",
     }:
         return _bool_value(value, strict=not from_env)
+    if key == "account_expiry_check_interval_minutes":
+        try:
+            result = int(str(value).strip())
+        except Exception as exc:
+            raise ValueError("فاصله بررسی اعلان‌ها باید عدد صحیح باشد") from exc
+        if result < 5 or result > 1440:
+            raise ValueError("فاصله بررسی اعلان‌ها باید بین 5 و 1440 دقیقه باشد")
+        return result
     if key == "xui_sub_public_base":
         return _http_url_or_zero(value, "Change Subscription URL", trailing_slash=True)
     if key == "zarinpal_merchant_id":
@@ -278,6 +290,8 @@ def build_migration_seed(source: Mapping | None = None) -> dict:
         "card_transfer_enabled": DEFAULTS["card_transfer_enabled"],
         "card_transfer_card_number": DEFAULTS["card_transfer_card_number"],
         "card_transfer_card_holder": DEFAULTS["card_transfer_card_holder"],
+        "account_expiry_notifications_enabled": DEFAULTS["account_expiry_notifications_enabled"],
+        "account_expiry_check_interval_minutes": DEFAULTS["account_expiry_check_interval_minutes"],
     }
     return {key: normalize_setting(key, value, from_env=True) for key, value in raw.items()}
 
@@ -405,6 +419,7 @@ def initialize_runtime_settings(
                 env_admin_ids=tuple(x for x in ids if int(x) != root),
             )
             state = initialize_feature_toggles(DEFAULTS)
+            state = initialize_v101_expiry_notifications(DEFAULTS)
             return APP_SETTINGS.replace(state, root_admin_id=root)
         seed = build_migration_seed(source)
         remarks = (
@@ -424,6 +439,7 @@ def initialize_runtime_settings(
             env_admin_ids=tuple(x for x in ids if int(x) != root),
         )
         state = initialize_feature_toggles(DEFAULTS)
+        state = initialize_v101_expiry_notifications(DEFAULTS)
         return APP_SETTINGS.replace(state, root_admin_id=root)
 
 

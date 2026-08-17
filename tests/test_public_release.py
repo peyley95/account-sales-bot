@@ -91,8 +91,8 @@ class PublicReleaseTests(unittest.TestCase):
         }
         self.assertEqual(lines, {"BOT_TOKEN", "ADMIN_IDS", "DATA_DIR"})
 
-    def test_version_is_first_public_release(self):
-        self.assertEqual((ROOT / "VERSION").read_text(encoding="utf-8").strip(), "1.0.0")
+    def test_version_is_current_public_release(self):
+        self.assertEqual((ROOT / "VERSION").read_text(encoding="utf-8").strip(), "1.0.1")
 
 
 if __name__ == "__main__":

@@ -114,6 +114,17 @@ def _schema(conn: sqlite3.Connection):
         CREATE INDEX IF NOT EXISTS idx_accounts_owner_service ON accounts(tg_id, service);
         CREATE INDEX IF NOT EXISTS idx_accounts_identifier ON accounts(identifier COLLATE NOCASE);
 
+        CREATE TABLE IF NOT EXISTS account_expiry_notifications (
+            account_id INTEGER PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+            warning_cycle_key TEXT NOT NULL DEFAULT '',
+            warning_claimed_at TEXT NOT NULL DEFAULT '',
+            warning_sent_at TEXT NOT NULL DEFAULT '',
+            expired_cycle_key TEXT NOT NULL DEFAULT '',
+            expired_claimed_at TEXT NOT NULL DEFAULT '',
+            expired_sent_at TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS purchases (
             order_id TEXT PRIMARY KEY,
             tg_id INTEGER NOT NULL REFERENCES users(tg_id) ON DELETE CASCADE,
@@ -358,7 +369,7 @@ def _schema(conn: sqlite3.Connection):
             "ALTER TABLE resellers ADD COLUMN trial_enabled INTEGER NOT NULL DEFAULT 1 "
             "CHECK(trial_enabled IN (0,1))"
         )
-    conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version','26')")
+    conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version','27')")
 
 
 def _read_json_file(path: str) -> dict:
@@ -647,6 +658,120 @@ def list_accounts(tg_id: int, service: str) -> list[dict]:
                 item["links"] = list(item["links"])
             result.append(item)
         return result
+    finally:
+        conn.close()
+
+
+def list_accounts_for_expiry_monitor() -> list[dict]:
+    """Load monitor candidates in one SQLite read, excluding free Trial rows.
+
+    The background scanner must not reopen SQLite once per account. Returning
+    the database row version also lets the notification claim reject a stale
+    result if a renewal updates the account during the remote status check.
+    """
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            """SELECT id,tg_id,service,identifier,data_json,created_at,updated_at
+               FROM accounts
+               WHERE service IN ('openvpn','v2ray')
+               ORDER BY service,id"""
+        ).fetchall()
+        result = []
+        for row in rows:
+            data = _json_loads(row["data_json"], {})
+            item = dict(data) if isinstance(data, dict) else {}
+            if bool(item.get("is_test", False)):
+                continue
+            item.update({
+                "account_id": int(row["id"]),
+                "tg_id": int(row["tg_id"]),
+                "service": str(row["service"]),
+                "identifier": str(row["identifier"]),
+                "created_at": str(item.get("created_at") or row["created_at"]),
+                "updated_at": str(row["updated_at"]),
+            })
+            if isinstance(item.get("links"), list):
+                item["links"] = list(item["links"])
+            result.append(item)
+        return result
+    finally:
+        conn.close()
+
+
+def claim_account_expiry_notification(
+    account_id: int, kind: str, cycle_key: str
+) -> bool:
+    """Atomically reserve one warning/expiry message for one account cycle.
+
+    Reservation happens before the Telegram request, giving at-most-once
+    behavior even if the process is interrupted during a send. A later renewal
+    changes accounts.updated_at and starts a fresh notification cycle.
+    """
+    notification_kind = str(kind or "").strip().lower()
+    if notification_kind not in {"warning", "expired"}:
+        raise ValueError("Notification kind must be warning or expired")
+    expected_cycle = str(cycle_key or "")
+    if not expected_cycle:
+        raise ValueError("Notification cycle key is required")
+    cycle_column = f"{notification_kind}_cycle_key"
+    claimed_column = f"{notification_kind}_claimed_at"
+    sent_column = f"{notification_kind}_sent_at"
+    with _tx(immediate=True) as conn:
+        account = conn.execute(
+            "SELECT updated_at FROM accounts WHERE id=?", (int(account_id),)
+        ).fetchone()
+        if not account or str(account["updated_at"]) != expected_cycle:
+            return False
+        state = conn.execute(
+            "SELECT warning_cycle_key,expired_cycle_key FROM account_expiry_notifications WHERE account_id=?",
+            (int(account_id),),
+        ).fetchone()
+        if state and str(state[cycle_column] or "") == expected_cycle:
+            return False
+        ts = now_iso()
+        conn.execute(
+            """INSERT OR IGNORE INTO account_expiry_notifications(account_id,updated_at)
+               VALUES(?,?)""",
+            (int(account_id), ts),
+        )
+        conn.execute(
+            f"""UPDATE account_expiry_notifications
+                SET {cycle_column}=?,{claimed_column}=?,{sent_column}='',updated_at=?
+                WHERE account_id=?""",
+            (expected_cycle, ts, ts, int(account_id)),
+        )
+        return True
+
+
+def mark_account_expiry_notification_sent(
+    account_id: int, kind: str, cycle_key: str
+) -> bool:
+    notification_kind = str(kind or "").strip().lower()
+    if notification_kind not in {"warning", "expired"}:
+        raise ValueError("Notification kind must be warning or expired")
+    cycle_column = f"{notification_kind}_cycle_key"
+    sent_column = f"{notification_kind}_sent_at"
+    ts = now_iso()
+    with _tx(immediate=True) as conn:
+        cur = conn.execute(
+            f"""UPDATE account_expiry_notifications
+                SET {sent_column}=?,updated_at=?
+                WHERE account_id=? AND {cycle_column}=?""",
+            (ts, ts, int(account_id), str(cycle_key or "")),
+        )
+        return bool(cur.rowcount)
+
+
+def get_account_expiry_notification_state(account_id: int) -> dict:
+    """Read one notification row for diagnostics and regression tests."""
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT * FROM account_expiry_notifications WHERE account_id=?",
+            (int(account_id),),
+        ).fetchone()
+        return dict(row) if row else {}
     finally:
         conn.close()
 
@@ -1987,6 +2112,7 @@ _SALES_SETTINGS_V34_MIGRATION_KEY = "app_sales_settings_v34_initialized"
 _PAYMENT_SETTINGS_V35_MIGRATION_KEY = "app_payment_settings_v35_initialized"
 RESELLERS_V36_MIGRATION_KEY = "resellers_v36_migrated"
 FEATURE_TOGGLES_V100_MIGRATION_KEY = "feature_toggles_v100_initialized"
+EXPIRY_NOTIFICATIONS_V101_MIGRATION_KEY = "expiry_notifications_v101_initialized"
 _APP_SETTING_KEYS = {
     "bot_brand_name",
     "account_username_prefix",
@@ -2017,6 +2143,8 @@ _APP_SETTING_KEYS = {
     "v2ray_sales_enabled",
     "referral_enabled",
     "wallet_enabled",
+    "account_expiry_notifications_enabled",
+    "account_expiry_check_interval_minutes",
 }
 _SECRET_APP_SETTING_KEYS = {"api_pass", "xui_api_token", "card_transfer_card_number"}
 
@@ -2230,6 +2358,40 @@ def initialize_feature_toggles(defaults: dict | None = None) -> dict:
             )
             conn.execute(
                 "INSERT OR REPLACE INTO meta(key,value) VALUES('feature_toggles_v100_initialized_at',?)",
+                (ts,),
+            )
+        return _app_settings_state_from_conn(conn)
+
+
+def initialize_v101_expiry_notifications(defaults: dict | None = None) -> dict:
+    """Add v1.0.1 monitor settings without overwriting later Admin choices."""
+    supplied = dict(defaults or {})
+    values = {
+        "account_expiry_notifications_enabled": bool(
+            supplied.get("account_expiry_notifications_enabled", True)
+        ),
+        "account_expiry_check_interval_minutes": int(
+            supplied.get("account_expiry_check_interval_minutes", 30)
+        ),
+    }
+    with _tx(immediate=True) as conn:
+        marker = conn.execute(
+            "SELECT value FROM meta WHERE key=?",
+            (EXPIRY_NOTIFICATIONS_V101_MIGRATION_KEY,),
+        ).fetchone()
+        if not marker:
+            ts = now_iso()
+            for key, value in values.items():
+                conn.execute(
+                    "INSERT OR IGNORE INTO app_settings(key,value_json,updated_at) VALUES(?,?,?)",
+                    (key, _json_dumps(value), ts),
+                )
+            conn.execute(
+                "INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)",
+                (EXPIRY_NOTIFICATIONS_V101_MIGRATION_KEY, "1.0.1"),
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO meta(key,value) VALUES('expiry_notifications_v101_initialized_at',?)",
                 (ts,),
             )
         return _app_settings_state_from_conn(conn)

@@ -131,7 +131,7 @@ class ResellerTrialMigrationTests(TemporaryResellerTrialDatabase):
         finally:
             conn.close()
         self.assertIn("trial_enabled", columns)
-        self.assertEqual(version, "26")
+        self.assertEqual(version, "27")
 
     def test_trial_permission_refreshes_atomic_runtime_snapshot_immediately(self):
         reseller = self.add_reseller(tg_id=780011, trial_enabled=False)
