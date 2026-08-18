@@ -5,7 +5,7 @@ import shutil
 import sqlite3
 import threading
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from config import DATA_DIR, REFERRAL_CODE_PREFIX, AUTO_BACKUP_ENABLED
@@ -783,13 +783,27 @@ def upsert_account(tg_id: int, service: str, identifier: str, **fields):
     with _tx(immediate=True) as conn:
         _ensure_user(conn, tg_id)
         row = conn.execute(
-            "SELECT data_json,created_at FROM accounts WHERE tg_id=? AND service=? AND identifier=?",
+            "SELECT data_json,created_at,updated_at FROM accounts WHERE tg_id=? AND service=? AND identifier=?",
             (int(tg_id), str(service), identifier),
         ).fetchone()
         previous = _json_loads(row["data_json"], {}) if row else {}
         item = dict(previous) if isinstance(previous, dict) else {}
         item.update(fields)
-        item.update({"service": str(service), "identifier": identifier, "updated_at": now_iso()})
+        updated_at = now_iso()
+        if row and str(row["updated_at"] or "") >= updated_at:
+            # Some platforms can return the same wall-clock timestamp for two
+            # immediate calls. Account notifications use this value as their
+            # renewal-cycle key, so every committed account update must advance.
+            try:
+                previous_dt = datetime.fromisoformat(
+                    str(row["updated_at"]).replace("Z", "+00:00")
+                )
+                if previous_dt.tzinfo is None:
+                    previous_dt = previous_dt.replace(tzinfo=timezone.utc)
+                updated_at = (previous_dt + timedelta(microseconds=1)).isoformat()
+            except Exception:
+                updated_at = (datetime.now(timezone.utc) + timedelta(microseconds=1)).isoformat()
+        item.update({"service": str(service), "identifier": identifier, "updated_at": updated_at})
         created = str(item.get("created_at") or (row["created_at"] if row else now_iso()))
         item["created_at"] = created
         conn.execute(
@@ -3515,11 +3529,56 @@ def set_auto_backup_enabled(enabled: bool, *, admin_tg_id: int = 0):
     return before, enabled
 
 
+def auto_backup_hour() -> int:
+    try:
+        value = int(get_setting("auto_backup_hour", 6))
+    except Exception:
+        value = 6
+    return value if 0 <= value <= 24 else 6
+
+
+def set_auto_backup_hour(hour: int, *, admin_tg_id: int = 0):
+    try:
+        normalized = int(hour)
+    except Exception as exc:
+        raise ValueError("ساعت بکاپ باید یک عدد صحیح باشد") from exc
+    if normalized < 0 or normalized > 24:
+        raise ValueError("ساعت بکاپ باید بین 0 و 24 باشد")
+    before = auto_backup_hour()
+    if before != normalized:
+        set_setting("auto_backup_hour", normalized)
+    if admin_tg_id and before != normalized:
+        record_admin_audit(
+            admin_tg_id=admin_tg_id,
+            action="auto_backup_hour_update",
+            before={"hour": before},
+            after={"hour": normalized},
+        )
+    return before, normalized
+
+
+def record_auto_backup_delivery(
+    *, filename: str, size_bytes: int, delivered_admin_ids=(), failed_admin_ids=(),
+) -> dict:
+    result = {
+        "created_at": now_iso(),
+        "filename": str(filename or ""),
+        "size_bytes": max(int(size_bytes or 0), 0),
+        "delivered_admin_ids": [int(value) for value in delivered_admin_ids or ()],
+        "failed_admin_ids": [int(value) for value in failed_admin_ids or ()],
+    }
+    set_setting("last_auto_backup_delivery", result)
+    return result
+
+
 def auto_backup_status() -> dict:
     last = get_setting("last_backup", {}) or {}
+    delivery = get_setting("last_auto_backup_delivery", {}) or {}
     return {
         "enabled": auto_backup_enabled(),
+        "hour": auto_backup_hour(),
         "last_backup": dict(last) if isinstance(last, dict) else {},
+        "last_delivery": dict(delivery) if isinstance(delivery, dict) else {},
     }
 
 

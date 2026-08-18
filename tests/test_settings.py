@@ -433,7 +433,7 @@ class MikroTikSettingsTests(SettingsStateCase):
         app_settings.update_setting("api_user", normalized_twice, admin_tg_id=1001)
         self.assertEqual(app_settings.get_setting("api_user"), username)
         message = FakeMessage()
-        asyncio.run(bot.show_admin_mikrotik_settings(message, 1001))
+        asyncio.run(bot.show_admin_mikrotik_connection(message, 1001))
         self.assertIn(f"<code>{username}</code>", message.edits[-1][0])
 
         restarted = app_settings.initialize_runtime_settings(
@@ -456,7 +456,7 @@ class MikroTikSettingsTests(SettingsStateCase):
         secret = "visible-only-to-admin"
         app_settings.update_setting("api_pass", secret, admin_tg_id=1001)
         message = FakeMessage()
-        asyncio.run(bot.show_admin_mikrotik_settings(message, 1001))
+        asyncio.run(bot.show_admin_mikrotik_connection(message, 1001))
         self.assertIn(secret, message.edits[-1][0])
         rows, _ = storage.list_admin_audit(offset=0, limit=100)
         row = next(r for r in rows if r["action"] == "API_PASS updated")
@@ -840,12 +840,12 @@ class RuntimeAndConnectionTests(SettingsStateCase):
         self.assertIn("connectivity/authentication succeeded", rendered)
         self.assertNotIn("User Manager", rendered)
 
-    def test_tehran_timezone_and_six_am_backup_are_fixed(self):
+    def test_tehran_timezone_is_fixed_and_backup_defaults_to_six(self):
         self.assertEqual(app_settings.APP_TIMEZONE, "Asia/Tehran")
         self.assertEqual(app_settings.APP_BACKUP_HOUR, 6)
         tz = bot._backup_timezone()
         before = datetime(2026, 8, 12, 5, 59, tzinfo=tz)
-        self.assertAlmostEqual(bot._seconds_until_next_backup(before), 60.0, delta=0.1)
+        self.assertAlmostEqual(bot._seconds_until_next_backup(before, hour=6), 60.0, delta=0.1)
         self.assertEqual(bot._format_tx_time("2026-08-12T00:00:00+00:00"), "2026-08-12 03:30")
 
 

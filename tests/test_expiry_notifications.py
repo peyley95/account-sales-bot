@@ -268,7 +268,7 @@ class ExpirySettingValidationTests(unittest.TestCase):
 
 
 class ExpiryAdminUiTests(unittest.IsolatedAsyncioTestCase):
-    async def test_bot_settings_expose_toggle_and_interval_controls(self):
+    async def test_notification_settings_expose_toggle_and_interval_controls(self):
         message = SimpleNamespace(edit_text=AsyncMock())
         snapshot = dict(bot.APP_SETTINGS.snapshot())
         snapshot.update({
@@ -279,7 +279,7 @@ class ExpiryAdminUiTests(unittest.IsolatedAsyncioTestCase):
             patch.object(bot, "is_admin", return_value=True),
             patch.object(bot.APP_SETTINGS, "snapshot", return_value=snapshot),
         ):
-            await bot.show_admin_bot_settings(message, 910001)
+            await bot.show_admin_notification_settings(message, 910001)
         text = message.edit_text.await_args.args[0]
         markup = message.edit_text.await_args.kwargs["reply_markup"]
         callbacks = [
@@ -288,7 +288,7 @@ class ExpiryAdminUiTests(unittest.IsolatedAsyncioTestCase):
             for button in row
             if button.callback_data
         ]
-        self.assertIn("اعلان پایان اکانت", text)
+        self.assertIn("یادآوری اتمام اکانت", text)
         self.assertIn("30 دقیقه", text)
         self.assertIn("admin_account_expiry_toggle", callbacks)
         self.assertIn("admin_cfg_edit|expinterval", callbacks)

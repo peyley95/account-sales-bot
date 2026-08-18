@@ -1442,15 +1442,16 @@ class AdminPanelV23Tests(unittest.IsolatedAsyncioTestCase):
         labels = [button.text for row in markup.inline_keyboard for button in row]
         for expected in (
             "👥 کاربران",
-            "💳 پرداخت و سفارش‌ها",
-            "🖥 سیستم و سرورها",
+            "🧾 سفارش‌ها",
+            "📦 فروش و بسته‌ها",
+            "🛠 سیستم و نگهداری",
             "⚙️ تنظیمات",
         ):
             self.assertIn(expected, labels)
         self.assertNotIn("📊 آمار و گزارش‌ها", labels)
         payments = bot.admin_payments_menu_keyboard()
         payment_labels = [button.text for row in payments.inline_keyboard for button in row]
-        self.assertIn("🎁 گزارش معرفی و کیف پول", payment_labels)
+        self.assertIn("📊 گزارش‌ها", payment_labels)
         callbacks = [button.callback_data for row in markup.inline_keyboard for button in row]
         self.assertTrue(all(len(value.encode("utf-8")) <= 64 for value in callbacks if value))
 
@@ -1462,7 +1463,7 @@ class AdminPanelV23Tests(unittest.IsolatedAsyncioTestCase):
         ):
             await bot.show_admin_system_menu(message, 1)
         self.assertEqual(len(message.edits), 1)
-        self.assertIn("سیستم و سرورها", message.edits[0][0])
+        self.assertIn("سیستم و نگهداری", message.edits[0][0])
 
     def test_pending_admin_rows_have_short_numeric_callback_ids(self):
         uid = 88001
@@ -1500,12 +1501,94 @@ class AutoBackupV23Tests(unittest.IsolatedAsyncioTestCase):
         finally:
             storage.set_auto_backup_enabled(old)
 
-    def test_next_backup_is_exactly_six_am_tehran(self):
+    def test_next_backup_uses_configured_hour_in_tehran(self):
         tz = bot._backup_timezone()
         before = datetime(2026, 8, 12, 5, 59, 0, tzinfo=tz)
         after = datetime(2026, 8, 12, 6, 1, 0, tzinfo=tz)
-        self.assertAlmostEqual(bot._seconds_until_next_backup(before), 60.0, delta=0.1)
-        self.assertAlmostEqual(bot._seconds_until_next_backup(after), 23 * 3600 + 59 * 60, delta=0.1)
+        self.assertAlmostEqual(bot._seconds_until_next_backup(before, hour=6), 60.0, delta=0.1)
+        self.assertAlmostEqual(bot._seconds_until_next_backup(after, hour=6), 23 * 3600 + 59 * 60, delta=0.1)
+        afternoon = datetime(2026, 8, 12, 15, 59, 0, tzinfo=tz)
+        self.assertAlmostEqual(bot._seconds_until_next_backup(afternoon, hour=16), 60.0, delta=0.1)
+        midnight = datetime(2026, 8, 12, 23, 59, 0, tzinfo=tz)
+        self.assertAlmostEqual(bot._seconds_until_next_backup(midnight, hour=24), 60.0, delta=0.1)
+
+    def test_backup_hour_is_persistent_validated_and_audited(self):
+        old = storage.auto_backup_hour()
+        try:
+            storage.set_auto_backup_hour(16, admin_tg_id=999)
+            self.assertEqual(storage.auto_backup_hour(), 16)
+            self.assertEqual(storage.auto_backup_status()["hour"], 16)
+            rows, _ = storage.list_admin_audit(offset=0, limit=20)
+            self.assertTrue(any(
+                row.get("action") == "auto_backup_hour_update" for row in rows
+            ))
+            with self.assertRaises(ValueError):
+                storage.set_auto_backup_hour(25, admin_tg_id=999)
+            self.assertEqual(storage.auto_backup_hour(), 16)
+        finally:
+            storage.set_auto_backup_hour(old)
+
+    async def test_scheduled_backup_is_sent_and_delivery_is_recorded(self):
+        result = storage.backup_database(force=True, keep=2)
+        sender = AsyncMock(return_value=None)
+        application = SimpleNamespace(bot=SimpleNamespace(send_document=sender))
+        with patch.object(bot, "effective_admin_ids", return_value=(999,)):
+            delivery = await bot._send_scheduled_backup(application, result)
+        sender.assert_awaited_once()
+        self.assertEqual(delivery["delivered_admin_ids"], [999])
+        self.assertEqual(delivery["failed_admin_ids"], [])
+        status = storage.auto_backup_status()
+        self.assertEqual(status["last_delivery"]["delivered_admin_ids"], [999])
+
+    async def test_scheduler_wires_due_backup_to_telegram_delivery(self):
+        wake = asyncio.Event()
+        application = SimpleNamespace(bot=SimpleNamespace())
+        wait_calls = 0
+
+        async def due_then_cancel(awaitable, *, timeout):
+            nonlocal wait_calls
+            wait_calls += 1
+            awaitable.close()
+            if wait_calls == 1:
+                raise asyncio.TimeoutError
+            raise asyncio.CancelledError
+
+        run = AsyncMock(side_effect=[
+            {"enabled": True, "hour": 16},
+            {"enabled": True, "hour": 16},
+            {"created": True, "path": "scheduled.sqlite3", "size_bytes": 10},
+            {"enabled": True, "hour": 16},
+        ])
+        delivery = AsyncMock(return_value={"delivered_admin_ids": [999]})
+        with (
+            patch.object(bot, "run_blocking", new=run),
+            patch.object(bot.asyncio, "wait_for", side_effect=due_then_cancel),
+            patch.object(bot, "_send_scheduled_backup", new=delivery),
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await bot._backup_loop(application, wake)
+        delivery.assert_awaited_once()
+        self.assertEqual(delivery.await_args.args[0], application)
+        self.assertEqual(delivery.await_args.args[1]["path"], "scheduled.sqlite3")
+
+    async def test_backup_settings_show_configurable_hour_control(self):
+        message = FakeMessage()
+        old = storage.auto_backup_hour()
+        try:
+            storage.set_auto_backup_hour(16)
+            with patch.object(bot, "is_admin", return_value=True):
+                await bot.show_admin_backup_settings(message, 999)
+            text, kwargs = message.edits[-1]
+            callbacks = [
+                button.callback_data
+                for row in kwargs["reply_markup"].inline_keyboard
+                for button in row
+                if button.callback_data
+            ]
+            self.assertIn("16:00", text)
+            self.assertIn("admin_backup_hour", callbacks)
+        finally:
+            storage.set_auto_backup_hour(old)
 
     async def test_backup_lane_saturation_does_not_block_database_lane(self):
         lane = bot.BLOCKING_LANES["backup"]

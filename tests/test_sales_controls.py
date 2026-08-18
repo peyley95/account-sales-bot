@@ -154,8 +154,8 @@ class ServiceSalesSettingsTests(TemporarySalesDatabase):
 class ServiceSalesUiTests(TemporarySalesDatabase, unittest.IsolatedAsyncioTestCase):
     async def test_admin_toggle_is_first_setting_in_each_service(self):
         for show, expected_callback, expected_text in (
-            (bot.show_admin_mikrotik_settings, "admin_service_sales|openvpn", "فروش OpenVPN"),
-            (bot.show_admin_xui_settings, "admin_service_sales|v2ray", "فروش V2ray"),
+            (bot.show_admin_mikrotik_settings, "admin_service_sales|openvpn", "فروش اوپن‌وی‌پی‌ان"),
+            (bot.show_admin_xui_settings, "admin_service_sales|v2ray", "فروش وی‌توری"),
         ):
             message = FakeMessage()
             with patch.object(bot, "is_admin", return_value=True):

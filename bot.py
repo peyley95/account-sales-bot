@@ -1,5 +1,6 @@
 import html
 import asyncio
+import os
 import hashlib
 import shutil
 import logging
@@ -33,7 +34,7 @@ from config import (
     BACKUP_KEEP, MAINTENANCE_MESSAGE,
 )
 from app_settings import (
-    APP_SETTINGS, APP_TIMEZONE, APP_BACKUP_HOUR,
+    APP_SETTINGS, APP_TIMEZONE,
     add_inbound, add_reseller, change_reseller_debt,
     charge_reseller_order, delete_inbound, edit_reseller,
     effective_admin_ids, get_setting as get_app_setting,
@@ -64,6 +65,7 @@ from storage import (
     get_user_admin_summary, list_user_transactions,
     record_admin_audit, list_admin_audit, maintenance_mode, set_maintenance_mode,
     auto_backup_enabled, set_auto_backup_enabled, auto_backup_status,
+    auto_backup_hour, set_auto_backup_hour, record_auto_backup_delivery,
     admin_dashboard_stats, admin_referral_stats,
     get_referral_settings, set_referral_percent,
     list_service_sale_plans, create_sale_plan,
@@ -97,6 +99,16 @@ logger = logging.getLogger("account-sales-bot")
 
 SERVICE_LABEL = {"openvpn": "OpenVPN", "v2ray": "V2Ray"}
 _ACCOUNT_EXPIRY_MONITOR_WAKE = None
+_BACKUP_SCHEDULER_WAKE = None
+_RLM = "\u200f"
+
+
+def admin_rtl_text(value: str) -> str:
+    """Keep mixed Persian/English admin lines stable in Telegram's bidi layout."""
+    return "\n".join(
+        (_RLM + line) if line else line
+        for line in str(value or "").split("\n")
+    )
 
 
 def welcome_text() -> str:
@@ -1154,7 +1166,7 @@ async def show_admin_transactions(message, admin_tg_id: int, page: int = 0):
                 text += "<i>ثبت قدیمی؛ جزئیات روش پرداخت در نسخه قبلی ذخیره نشده.</i>\n"
             text += "\n"
     await message.edit_text(
-        text,
+        admin_rtl_text(text),
         parse_mode="HTML",
         reply_markup=admin_transactions_keyboard(page, total),
         disable_web_page_preview=True,
@@ -1295,10 +1307,15 @@ def admin_wallet_confirm_keyboard(action: str, user_tg_id: int, amount: int, ope
 
 def admin_tools_keyboard(_maintenance: bool | None = None):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("👥 کاربران", callback_data="admin_users_menu")],
-        [InlineKeyboardButton("💳 پرداخت و سفارش‌ها", callback_data="admin_payments_menu")],
-        [InlineKeyboardButton("🖥 سیستم و سرورها", callback_data="admin_system_menu")],
-        [InlineKeyboardButton("⚙️ تنظیمات", callback_data="admin_settings_menu")],
+        [
+            InlineKeyboardButton("🧾 سفارش‌ها", callback_data="admin_payments_menu"),
+            InlineKeyboardButton("👥 کاربران", callback_data="admin_users_menu"),
+        ],
+        [
+            InlineKeyboardButton("📦 فروش و بسته‌ها", callback_data="admin_sales_menu"),
+            InlineKeyboardButton("⚙️ تنظیمات", callback_data="admin_settings_menu"),
+        ],
+        [InlineKeyboardButton("🛠 سیستم و نگهداری", callback_data="admin_system_menu")],
         [InlineKeyboardButton("🔙 منوی اصلی", callback_data="home")],
     ])
 
@@ -1306,28 +1323,46 @@ def admin_tools_keyboard(_maintenance: bool | None = None):
 async def show_admin_tools(message, admin_tg_id: int):
     if not is_admin(admin_tg_id):
         return
-    stats, maintenance, backup = await asyncio.gather(
+    day_start, month_start, _now_local = _admin_report_boundaries()
+    stats, maintenance, backup, dashboard = await asyncio.gather(
         run_blocking(database_stats, check_integrity=False),
         run_blocking(maintenance_mode),
         run_blocking(auto_backup_status),
+        run_blocking(
+            admin_dashboard_stats,
+            day_start_utc=day_start,
+            month_start_utc=month_start,
+        ),
     )
     counts = stats.get("counts") or {}
+    today = dashboard.get("today") or {}
+    pending = int(counts.get("pending_payments", 0))
+    card_waiting = int(stats.get("card_transfer_waiting") or 0)
+    incomplete = int(stats.get("incomplete_fulfillments") or 0)
     text = (
-        "⚙️ <b>پنل مدیریت</b>\n\n"
+        "🛠 <b>پنل مدیریت</b>\n\n"
         f"👥 کاربران: <b>{int(counts.get('users', 0)):,}</b>\n"
-        f"⏳ سفارش Pending: <b>{int(counts.get('pending_payments', 0)):,}</b>\n"
-        f"🛠 تعمیرات: <b>{'فعال 🔴' if maintenance else 'غیرفعال 🟢'}</b>\n"
-        f"💾 بکاپ خودکار: <b>{'روشن ✅' if backup.get('enabled') else 'خاموش ❌'}</b>"
+        f"🛍 خرید امروز: <b>{int(today.get('buys', 0)):,}</b>\n"
+        f"♻️ تمدید امروز: <b>{int(today.get('renews', 0)):,}</b>\n"
+        f"💰 فروش امروز: <b>{int(today.get('revenue_toman', 0)):,} تومان</b>\n\n"
+        f"⏳ سفارش‌های در انتظار: <b>{pending:,}</b>\n"
+        f"🧾 رسیدهای نیازمند بررسی: <b>{card_waiting:,}</b>\n"
+        f"⚠️ تحویل‌های ناقص: <b>{incomplete:,}</b>\n\n"
+        f"🛠 حالت تعمیرات: <b>{'⚠️ فعال' if maintenance else '✅ غیرفعال'}</b>\n"
+        f"💾 بکاپ خودکار: <b>{'✅ فعال' if backup.get('enabled') else '⛔ غیرفعال'}</b>"
     )
-    await message.edit_text(text, parse_mode="HTML", reply_markup=admin_tools_keyboard())
+    await message.edit_text(
+        admin_rtl_text(text), parse_mode="HTML", reply_markup=admin_tools_keyboard()
+    )
 
 
 def admin_users_menu_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔎 جستجوی کاربر", callback_data="admin_global_search")],
         [InlineKeyboardButton("📋 لیست کاربران", callback_data="admin_users|0")],
+        [InlineKeyboardButton("🤝 مدیریت ریسلرها", callback_data="admin_resellers")],
         [InlineKeyboardButton("💰 کیف پول‌های دارای موجودی", callback_data="admin_wallet_pos|0")],
-        [InlineKeyboardButton("🔙 پنل مدیریت", callback_data="admin_tools")],
+        [InlineKeyboardButton("🔙 بازگشت", callback_data="admin_tools")],
     ])
 
 
@@ -1337,10 +1372,11 @@ async def show_admin_users_menu(message, admin_tg_id: int):
     stats = await run_blocking(database_stats, check_integrity=False)
     counts = stats.get("counts") or {}
     await message.edit_text(
-        "👥 <b>کاربران</b>\n\n"
+        admin_rtl_text("👥 <b>کاربران و ریسلرها</b>\n\n"
         f"کاربران ثبت‌شده: <b>{int(counts.get('users', 0)):,}</b>\n"
         f"اکانت‌های ثبت‌شده: <b>{int(counts.get('accounts', 0)):,}</b>\n\n"
-        "جستجو، مشاهده کاربران و مدیریت کیف پول از این بخش انجام می‌شود.",
+        f"ریسلرهای فعال: <b>{len(reseller_records()):,}</b>\n\n"
+        "جستجو، مشاهده کاربران و مدیریت ریسلرها از این بخش انجام می‌شود."),
         parse_mode="HTML",
         reply_markup=admin_users_menu_keyboard(),
     )
@@ -1350,18 +1386,17 @@ def admin_payments_menu_keyboard(
     pending_count: int = 0, incomplete_count: int = 0, card_waiting: int = 0
 ):
     rows = [
-        [InlineKeyboardButton("✅ پرداخت‌های موفق", callback_data="admin_tx|0")],
-        [InlineKeyboardButton(f"⏳ سفارش‌های در انتظار ({pending_count})", callback_data="admin_pending|0")],
         [InlineKeyboardButton(
-            f"🧾 رسیدهای کارت به کارت ({card_waiting})", callback_data="admin_card_requests|0"
+            f"🧾 رسیدهای نیازمند بررسی ({card_waiting})", callback_data="admin_card_requests|0"
         )],
+        [InlineKeyboardButton(f"⏳ سفارش‌های در انتظار ({pending_count})", callback_data="admin_pending|0")],
     ]
     if incomplete_count:
         rows.append([InlineKeyboardButton(f"⚠️ تحویل‌های ناقص ({incomplete_count})", callback_data="admin_fulfillments")])
     rows.extend([
-        [InlineKeyboardButton("📊 داشبورد فروش", callback_data="admin_dashboard")],
-        [InlineKeyboardButton("🎁 گزارش معرفی و کیف پول", callback_data="admin_referral_report")],
-        [InlineKeyboardButton("🔙 پنل مدیریت", callback_data="admin_tools")],
+        [InlineKeyboardButton("✅ تراکنش‌های موفق", callback_data="admin_tx|0")],
+        [InlineKeyboardButton("📊 گزارش‌ها", callback_data="admin_reports_menu")],
+        [InlineKeyboardButton("🔙 بازگشت", callback_data="admin_tools")],
     ])
     return InlineKeyboardMarkup(rows)
 
@@ -1375,19 +1410,32 @@ async def show_admin_payments_menu(message, admin_tg_id: int):
     incomplete = int(stats.get("incomplete_fulfillments") or 0)
     card_waiting = int(stats.get("card_transfer_waiting") or 0)
     await message.edit_text(
-        "💳 <b>پرداخت و سفارش‌ها</b>\n\n"
+        admin_rtl_text("🧾 <b>سفارش‌ها و پرداخت‌ها</b>\n\n"
         f"✅ تراکنش‌های موفق: <b>{int(counts.get('transactions', 0)):,}</b>\n"
-        f"⏳ Pending: <b>{pending:,}</b>\n"
-        f"⚠️ تحویل ناقص: <b>{incomplete:,}</b>\n\n"
-        "بررسی پرداخت‌ها فقط برای همان سفارش و با درخواست مستقیم انجام می‌شود.",
+        f"⏳ سفارش‌های در انتظار: <b>{pending:,}</b>\n"
+        f"🧾 رسیدهای نیازمند بررسی: <b>{card_waiting:,}</b>\n"
+        f"⚠️ تحویل‌های ناقص: <b>{incomplete:,}</b>"),
         parse_mode="HTML",
         reply_markup=admin_payments_menu_keyboard(pending, incomplete, card_waiting),
     )
 
 
 async def show_admin_reports_menu(message, admin_tg_id: int):
-    # Safe compatibility for old Telegram callback buttons from v3.4.
-    await show_admin_payments_menu(message, admin_tg_id)
+    if not is_admin(admin_tg_id):
+        return
+    await message.edit_text(
+        admin_rtl_text(
+            "📊 <b>گزارش‌ها</b>\n\n"
+            "گزارش فروش، تراکنش‌ها و وضعیت معرفی و کیف پول را از اینجا مشاهده کنید."
+        ),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📊 داشبورد فروش", callback_data="admin_dashboard")],
+            [InlineKeyboardButton("🎁 گزارش معرفی و کیف پول", callback_data="admin_referral_report")],
+            [InlineKeyboardButton("✅ تراکنش‌های موفق", callback_data="admin_tx|0")],
+            [InlineKeyboardButton("🔙 بازگشت", callback_data="admin_payments_menu")],
+        ]),
+    )
 
 
 def _admin_report_boundaries():
@@ -1423,15 +1471,15 @@ async def show_admin_dashboard(message, admin_tg_id: int):
         f"🔵 OpenVPN: <b>{int(today.get('openvpn', 0)):,}</b> | 🟣 V2Ray: <b>{int(today.get('v2ray', 0)):,}</b>\n"
         f"💰 فروش امروز: <b>{int(today.get('revenue_toman', 0)):,} تومان</b>\n"
         f"💰 فروش این ماه: <b>{int(month.get('revenue_toman', 0)):,} تومان</b>\n\n"
-        f"⏳ Pending: <b>{int(counts.get('pending', 0)):,}</b>\n"
-        f"⚠️ تحویل ناقص: <b>{int(counts.get('incomplete', 0)):,}</b>"
+        f"⏳ سفارش‌های در انتظار: <b>{int(counts.get('pending', 0)):,}</b>\n"
+        f"⚠️ تحویل‌های ناقص: <b>{int(counts.get('incomplete', 0)):,}</b>"
     )
     await message.edit_text(
-        text,
+        admin_rtl_text(text),
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("🧾 تراکنش‌ها", callback_data="admin_tx|0")],
-            [InlineKeyboardButton("🔙 پرداخت و سفارش‌ها", callback_data="admin_payments_menu")],
+            [InlineKeyboardButton("🔙 بازگشت", callback_data="admin_reports_menu")],
         ]),
     )
 
@@ -1441,31 +1489,34 @@ async def show_admin_referral_report(message, admin_tg_id: int):
         return
     data = await run_blocking(admin_referral_stats)
     await message.edit_text(
-        "🎁 <b>گزارش معرفی و کیف پول</b>\n\n"
+        admin_rtl_text("🎁 <b>گزارش معرفی و کیف پول</b>\n\n"
         f"کدهای معرف ساخته‌شده: <b>{int(data.get('codes', 0)):,}</b>\n"
         f"معرف‌های استفاده‌شده: <b>{int(data.get('used', 0)):,}</b>\n"
         f"کل پاداش پرداخت‌شده: <b>{int(data.get('reward_toman', 0)):,} تومان</b>\n"
         f"کاربران دارای موجودی: <b>{int(data.get('wallet_users', 0)):,}</b>\n"
-        f"مجموع موجودی کیف پول‌ها: <b>{int(data.get('wallet_total_toman', 0)):,} تومان</b>",
+        f"مجموع موجودی کیف پول‌ها: <b>{int(data.get('wallet_total_toman', 0)):,} تومان</b>"),
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("💰 کیف پول‌های دارای موجودی", callback_data="admin_wallet_pos|0")],
-            [InlineKeyboardButton("🔙 پرداخت و سفارش‌ها", callback_data="admin_payments_menu")],
+            [InlineKeyboardButton("🔙 بازگشت", callback_data="admin_reports_menu")],
         ]),
     )
 
 
-def admin_system_menu_keyboard(incomplete: int = 0):
+def admin_system_menu_keyboard(incomplete: int = 0, maintenance: bool = False):
     rows = [
-        [InlineKeyboardButton("🩺 وضعیت ربات و سرورها", callback_data="admin_health")],
+        [InlineKeyboardButton("🩺 وضعیت ربات و اتصال‌ها", callback_data="admin_health")],
         [InlineKeyboardButton("🗄 وضعیت دیتابیس", callback_data="admin_database")],
+        [InlineKeyboardButton("💾 بکاپ و بازیابی", callback_data="admin_backup_settings")],
+        [InlineKeyboardButton(
+            "✅ خاموش کردن حالت تعمیرات"
+            if maintenance else "⚠️ فعال کردن حالت تعمیرات",
+            callback_data=f"admin_maintenance_set|{0 if maintenance else 1}",
+        )],
     ]
-    if incomplete:
-        rows.append([InlineKeyboardButton(f"⚠️ تحویل‌های ناقص ({incomplete})", callback_data="admin_fulfillments")])
     rows.extend([
-        [InlineKeyboardButton("💾 بکاپ فوری", callback_data="admin_backup")],
-        [InlineKeyboardButton("📜 Audit Log", callback_data="admin_audit|0")],
-        [InlineKeyboardButton("🔙 پنل مدیریت", callback_data="admin_tools")],
+        [InlineKeyboardButton("📜 تاریخچه فعالیت مدیر", callback_data="admin_audit|0")],
+        [InlineKeyboardButton("🔙 بازگشت", callback_data="admin_tools")],
     ])
     return InlineKeyboardMarkup(rows)
 
@@ -1482,17 +1533,24 @@ async def show_admin_system_menu(message, admin_tg_id: int):
     def cached(name: str) -> str:
         row = services.get(name) or {}
         if not row:
-            return "⚪"
-        return "✅" if row.get("ok") else "❌"
+            return "⚪ بررسی نشده"
+        return "✅ متصل" if row.get("ok") else "❌ قطع"
+    maintenance = current_maintenance_mode()
+    hour = int(backup.get("hour", 6))
     await message.edit_text(
-        "🖥 <b>سیستم و سرورها</b>\n\n"
-        f"RouterOS: {cached('mikrotik')} | 3x-ui: {cached('xui')}\n"
-        f"SQLite: <b>آماده</b> | {human_bytes(int(db.get('size_bytes') or 0))}\n"
-        f"Uptime: <b>{_human_duration(snap.get('uptime_seconds', 0))}</b>\n"
-        f"💾 بکاپ خودکار: <b>{'روشن ✅' if backup.get('enabled') else 'خاموش ❌'}</b>\n\n"
-        "نمایش این صفحه از Cache و SQLite است؛ تست شبکه فقط با دکمه تست زنده انجام می‌شود.",
+        admin_rtl_text("🛠 <b>سیستم و نگهداری</b>\n\n"
+        f"روتر میکروتیک: <b>{cached('mikrotik')}</b>\n"
+        f"پنل ثنایی: <b>{cached('xui')}</b>\n"
+        f"دیتابیس: <b>✅ آماده</b>\n"
+        f"حجم دیتابیس: <b>{human_bytes(int(db.get('size_bytes') or 0))}</b>\n"
+        f"زمان فعالیت ربات: <b>{_human_duration(snap.get('uptime_seconds', 0))}</b>\n\n"
+        f"💾 بکاپ خودکار: <b>{'✅ فعال' if backup.get('enabled') else '⛔ غیرفعال'}</b>\n"
+        f"🕒 ساعت بکاپ: <b>{hour:02d}:00</b>\n"
+        f"🛠 حالت تعمیرات: <b>{'⚠️ فعال' if maintenance else '✅ غیرفعال'}</b>"),
         parse_mode="HTML",
-        reply_markup=admin_system_menu_keyboard(int(db.get("incomplete_fulfillments") or 0)),
+        reply_markup=admin_system_menu_keyboard(
+            int(db.get("incomplete_fulfillments") or 0), maintenance
+        ),
     )
 
 
@@ -1502,65 +1560,121 @@ async def show_admin_database(message, admin_tg_id: int):
     db = await run_blocking(database_stats, check_integrity=True)
     counts = db.get("counts") or {}
     await message.edit_text(
-        "🗄 <b>وضعیت دیتابیس</b>\n\n"
-        f"Integrity: <b>{html.escape(str(db.get('quick_check') or '-'))}</b>\n"
+        admin_rtl_text("🗄 <b>وضعیت دیتابیس</b>\n\n"
+        f"سلامت دیتابیس: <b>{html.escape(str(db.get('quick_check') or '-'))}</b>\n"
         f"حجم: <b>{human_bytes(int(db.get('size_bytes') or 0))}</b>\n"
-        f"Users: <b>{int(counts.get('users', 0)):,}</b>\n"
-        f"Accounts: <b>{int(counts.get('accounts', 0)):,}</b>\n"
-        f"Transactions: <b>{int(counts.get('transactions', 0)):,}</b>\n"
-        f"Pending: <b>{int(counts.get('pending_payments', 0)):,}</b>\n"
-        f"Wallet TX: <b>{int(counts.get('wallet_transactions', 0)):,}</b>\n"
-        f"Fulfillments: <b>{int(counts.get('fulfillments', 0)):,}</b>",
+        f"کاربران: <b>{int(counts.get('users', 0)):,}</b>\n"
+        f"اکانت‌ها: <b>{int(counts.get('accounts', 0)):,}</b>\n"
+        f"تراکنش‌ها: <b>{int(counts.get('transactions', 0)):,}</b>\n"
+        f"سفارش‌های در انتظار: <b>{int(counts.get('pending_payments', 0)):,}</b>\n"
+        f"تراکنش‌های کیف پول: <b>{int(counts.get('wallet_transactions', 0)):,}</b>\n"
+        f"عملیات تحویل: <b>{int(counts.get('fulfillments', 0)):,}</b>"),
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 سیستم و سرورها", callback_data="admin_system_menu")]]),
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت", callback_data="admin_system_menu")]]),
     )
 
 
-def admin_settings_menu_keyboard(maintenance: bool, backup_enabled: bool):
+def admin_settings_menu_keyboard(
+    maintenance: bool = False, backup_enabled: bool = False
+):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🤖 تنظیمات ربات", callback_data="admin_cfg|bot")],
-        [InlineKeyboardButton("🔵 تنظیمات میکروتیک", callback_data="admin_cfg|mikrotik")],
-        [InlineKeyboardButton("🟣 تنظیمات ثنایی", callback_data="admin_cfg|xui")],
+        [InlineKeyboardButton("🤖 تنظیمات عمومی ربات", callback_data="admin_cfg|bot")],
+        [InlineKeyboardButton("🌐 اتصال‌ها و سرویس‌ها", callback_data="admin_connections_menu")],
         [InlineKeyboardButton("💳 درگاه‌های پرداخت", callback_data="admin_gateways")],
-        [InlineKeyboardButton("🎁 تنظیمات Referral", callback_data="admin_referral_settings")],
-        [InlineKeyboardButton("💰 تنظیمات کیف پول", callback_data="admin_wallet_settings")],
-        [InlineKeyboardButton(
-            "💾 تنظیمات بکاپ" + (" ✅" if backup_enabled else " ❌"),
-            callback_data="admin_backup_settings",
-        )],
-        [InlineKeyboardButton("📦 مدیریت بسته‌ها", callback_data="admin_plans|0")],
-        [InlineKeyboardButton(
-            "🟢 خاموش کردن تعمیرات" if maintenance else "🔴 فعال کردن تعمیرات",
-            callback_data=f"admin_maintenance_set|{0 if maintenance else 1}",
-        )],
-        [InlineKeyboardButton("🔙 پنل مدیریت", callback_data="admin_tools")],
+        [InlineKeyboardButton("🎁 بازاریابی و کیف پول", callback_data="admin_marketing_menu")],
+        [InlineKeyboardButton("🔔 اعلان‌ها", callback_data="admin_notification_settings")],
+        [InlineKeyboardButton("🔙 بازگشت", callback_data="admin_tools")],
     ])
 
 
 async def show_admin_settings_menu(message, admin_tg_id: int):
     if not is_admin(admin_tg_id):
         return
-    maintenance = current_maintenance_mode()
-    backup = await run_blocking(auto_backup_status)
     await message.edit_text(
-        "⚙️ <b>تنظیمات</b>\n\n"
-        f"حالت تعمیرات: <b>{'فعال 🔴' if maintenance else 'غیرفعال 🟢'}</b>\n"
-        f"بکاپ خودکار: <b>{'روشن ✅' if backup.get('enabled') else 'خاموش ❌'}</b>\n"
-        f"زمان بکاپ: <b>{APP_BACKUP_HOUR:02d}:00</b>",
+        admin_rtl_text(
+            "⚙️ <b>تنظیمات</b>\n\n"
+            "بخش موردنظر را انتخاب کنید. تنظیمات سیستم، بکاپ و حالت تعمیرات در بخش «سیستم و نگهداری» قرار دارد."
+        ),
         parse_mode="HTML",
-        reply_markup=admin_settings_menu_keyboard(maintenance, bool(backup.get("enabled"))),
+        reply_markup=admin_settings_menu_keyboard(),
+    )
+
+
+async def show_admin_connections_menu(message, admin_tg_id: int):
+    if not is_admin(admin_tg_id):
+        return
+    snap = APP_SETTINGS.snapshot()
+    openvpn_enabled = bool(snap.get("openvpn_sales_enabled", True))
+    v2ray_enabled = bool(snap.get("v2ray_sales_enabled", True))
+    await message.edit_text(
+        admin_rtl_text(
+            "🌐 <b>اتصال‌ها و سرویس‌ها</b>\n\n"
+            f"🔵 فروش اوپن‌وی‌پی‌ان: <b>{'✅ فعال' if openvpn_enabled else '⛔ غیرفعال'}</b>\n"
+            f"🟣 فروش وی‌توری: <b>{'✅ فعال' if v2ray_enabled else '⛔ غیرفعال'}</b>\n\n"
+            "تنظیمات هر سرویس و آزمایش اتصال از بخش مربوط انجام می‌شود."
+        ),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔵 میکروتیک و اوپن‌وی‌پی‌ان", callback_data="admin_cfg|mikrotik")],
+            [InlineKeyboardButton("🟣 پنل ثنایی و وی‌توری", callback_data="admin_cfg|xui")],
+            [InlineKeyboardButton("🔙 بازگشت", callback_data="admin_settings_menu")],
+        ]),
+    )
+
+
+async def show_admin_marketing_menu(message, admin_tg_id: int):
+    if not is_admin(admin_tg_id):
+        return
+    await message.edit_text(
+        admin_rtl_text(
+            "🎁 <b>بازاریابی و کیف پول</b>\n\n"
+            f"معرفی و بازاریابی: <b>{'✅ فعال' if referral_enabled() else '⛔ غیرفعال'}</b>\n"
+            f"کیف پول: <b>{'✅ فعال' if wallet_enabled() else '⛔ غیرفعال'}</b>"
+        ),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🎁 تنظیمات معرفی", callback_data="admin_referral_settings")],
+            [InlineKeyboardButton("💰 تنظیمات کیف پول", callback_data="admin_wallet_settings")],
+            [InlineKeyboardButton("🔙 بازگشت", callback_data="admin_settings_menu")],
+        ]),
+    )
+
+
+async def show_admin_notification_settings(message, admin_tg_id: int):
+    if not is_admin(admin_tg_id):
+        return
+    snap = APP_SETTINGS.snapshot()
+    enabled = bool(snap.get("account_expiry_notifications_enabled", True))
+    interval = int(snap.get("account_expiry_check_interval_minutes") or 30)
+    await message.edit_text(
+        admin_rtl_text(
+            "🔔 <b>اعلان‌ها</b>\n\n"
+            f"یادآوری اتمام اکانت: <b>{'✅ فعال' if enabled else '⛔ غیرفعال'}</b>\n"
+            f"فاصله بررسی: <b>{interval:,} دقیقه</b>\n\n"
+            "هر اکانت برای هشدار نزدیک به اتمام و پیام اتمام، فقط یک‌بار اعلان دریافت می‌کند."
+        ),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                "⛔ غیرفعال کردن یادآوری"
+                if enabled else "✅ فعال کردن یادآوری",
+                callback_data="admin_account_expiry_toggle",
+            )],
+            [InlineKeyboardButton("⏱ تغییر فاصله بررسی", callback_data="admin_cfg_edit|expinterval")],
+            [InlineKeyboardButton("🔙 بازگشت", callback_data="admin_settings_menu")],
+        ]),
     )
 
 
 _ADMIN_CONFIG_FIELDS = {
     "brand": ("bot_brand_name", "نام برند", "bot"),
     "userpre": ("account_username_prefix", "پیشوند نام اکانت", "bot"),
-    "refpre": ("referral_code_prefix", "پیشوند کد Referral", "bot"),
-    "ovpnurl": ("openvpn_connections_url", "لینک راهنمای OpenVPN", "bot"),
+    "refpre": ("referral_code_prefix", "پیشوند کد معرفی", "referral"),
+    "ovpnurl": ("openvpn_connections_url", "لینک راهنمای OpenVPN", "mikrotik"),
     "expinterval": (
         "account_expiry_check_interval_minutes",
         "فاصله بررسی اکانت‌ها (دقیقه)",
-        "bot",
+        "notifications",
     ),
     "mtip": ("api_ip", "Mikrotik IP", "mikrotik"),
     "mtport": ("api_port", "Mikrotik API Port", "mikrotik"),
@@ -1599,33 +1713,18 @@ async def show_admin_bot_settings(message, admin_tg_id: int):
     if not is_admin(admin_tg_id):
         return
     snap = APP_SETTINGS.snapshot()
-    openvpn_url = str(snap.get("openvpn_connections_url") or "0")
-    expiry_notifications = bool(snap.get("account_expiry_notifications_enabled", True))
-    expiry_interval = int(snap.get("account_expiry_check_interval_minutes") or 30)
     await message.edit_text(
-        "🤖 <b>تنظیمات ربات</b>\n\n"
+        admin_rtl_text("🤖 <b>تنظیمات عمومی ربات</b>\n\n"
         f"نام برند: <code>{html.escape(str(snap.get('bot_brand_name') or ''))}</code>\n"
         f"پیشوند نام اکانت: <code>{html.escape(str(snap.get('account_username_prefix') or ''))}</code>\n"
-        f"پیشوند Referral: <code>{html.escape(str(snap.get('referral_code_prefix') or ''))}</code>\n"
-        f"لینک OpenVPN: <code>{html.escape('Disabled' if openvpn_url == '0' else openvpn_url)}</code>\n"
-        f"مدیر اصلی: <code>{root_admin_id()}</code>\n"
-        f"ریسلرهای فعال: <b>{len(reseller_records())}</b>\n"
-        f"اعلان پایان اکانت: <b>{'فعال ✅' if expiry_notifications else 'غیرفعال ⛔'}</b>\n"
-        f"فاصله بررسی اکانت‌ها: <b>{expiry_interval} دقیقه</b>",
+        f"مدیر اصلی: <code>{root_admin_id()}</code>"),
         parse_mode="HTML",
         disable_web_page_preview=True,
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("✏️ نام برند", callback_data="admin_cfg_edit|brand")],
-            [InlineKeyboardButton("👥 ریسلرها", callback_data="admin_resellers")],
             [InlineKeyboardButton("✏️ پیشوند نام اکانت", callback_data="admin_cfg_edit|userpre")],
-            [InlineKeyboardButton("✏️ پیشوند کد Referral", callback_data="admin_cfg_edit|refpre")],
-            [InlineKeyboardButton("✏️ لینک راهنمای OpenVPN", callback_data="admin_cfg_edit|ovpnurl")],
-            [InlineKeyboardButton(
-                f"اعلان پایان اکانت: {'فعال ✅' if expiry_notifications else 'غیرفعال ⛔'}",
-                callback_data="admin_account_expiry_toggle",
-            )],
-            [InlineKeyboardButton("✏️ فاصله بررسی اکانت‌ها", callback_data="admin_cfg_edit|expinterval")],
-            [InlineKeyboardButton("🔙 تنظیمات", callback_data="admin_settings_menu")],
+            [InlineKeyboardButton("🔒 اطلاعات مدیر اصلی", callback_data="admin_root_info")],
+            [InlineKeyboardButton("🔙 بازگشت", callback_data="admin_settings_menu")],
         ]),
     )
 
@@ -1648,7 +1747,7 @@ async def show_admin_resellers(message, admin_tg_id: int):
         rows.append([InlineKeyboardButton(label[:64], callback_data=f"rs|{reseller_id}")])
     rows.extend([
         [InlineKeyboardButton("➕ افزودن ریسلر", callback_data="rsadd")],
-        [InlineKeyboardButton("🔙 تنظیمات ربات", callback_data="admin_cfg|bot")],
+        [InlineKeyboardButton("🔙 بازگشت", callback_data="admin_users_menu")],
     ])
     text = "👥 <b>ریسلرها</b>\n\n"
     if records:
@@ -1685,12 +1784,8 @@ async def show_admin_reseller_detail(message, admin_tg_id: int, reseller_id: int
     if rate <= 0:
         text += "\n\n⚠️ خرید این ریسلر تا تعیین هزینه هر گیگ مسدود است."
     await message.edit_text(
-        text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("✏️ نام", callback_data=f"rsedit|{reseller_id}|n"),
-                InlineKeyboardButton("✏️ Telegram ID", callback_data=f"rsedit|{reseller_id}|i"),
-            ],
-            [InlineKeyboardButton("✏️ هزینه هر گیگ", callback_data=f"rsedit|{reseller_id}|p")],
+        admin_rtl_text(text), parse_mode="HTML", reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✏️ ویرایش مشخصات", callback_data=f"rseditmenu|{reseller_id}")],
             [InlineKeyboardButton(
                 "⛔ غیرفعال‌کردن اکانت تست" if trial_enabled else "✅ فعال‌کردن اکانت تست",
                 callback_data=f"rstrial|{reseller_id}|{0 if trial_enabled else 1}",
@@ -1698,6 +1793,30 @@ async def show_admin_reseller_detail(message, admin_tg_id: int, reseller_id: int
             [InlineKeyboardButton("📒 مدیریت بدهی", callback_data=f"rsdebt|{reseller_id}")],
             [InlineKeyboardButton("🗑 حذف ریسلر", callback_data=f"rsdel|{reseller_id}")],
             [InlineKeyboardButton("🔙 ریسلرها", callback_data="admin_resellers")],
+        ]),
+    )
+
+
+async def show_admin_reseller_edit_menu(message, admin_tg_id: int, reseller_id: int):
+    if not is_admin(admin_tg_id):
+        return
+    reseller = _runtime_reseller_by_id(reseller_id)
+    if not reseller:
+        await show_admin_resellers(message, admin_tg_id)
+        return
+    await message.edit_text(
+        admin_rtl_text(
+            "✏️ <b>ویرایش مشخصات ریسلر</b>\n\n"
+            f"نام: <b>{html.escape(str(reseller.get('name') or ''))}</b>\n"
+            f"شناسه عددی تلگرام: <code>{int(reseller.get('tg_id') or 0)}</code>\n"
+            f"هزینه هر گیگ: <b>{int(reseller.get('price_per_gb_toman') or 0):,} تومان</b>"
+        ),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✏️ نام ریسلر", callback_data=f"rsedit|{reseller_id}|n")],
+            [InlineKeyboardButton("✏️ شناسه عددی تلگرام", callback_data=f"rsedit|{reseller_id}|i")],
+            [InlineKeyboardButton("✏️ هزینه هر گیگ", callback_data=f"rsedit|{reseller_id}|p")],
+            [InlineKeyboardButton("🔙 بازگشت", callback_data=f"rs|{reseller_id}")],
         ]),
     )
 
@@ -1726,29 +1845,68 @@ async def show_admin_mikrotik_settings(message, admin_tg_id: int):
         return
     snap = APP_SETTINGS.snapshot()
     sales_enabled = bool(snap.get("openvpn_sales_enabled", True))
+    openvpn_url = str(snap.get("openvpn_connections_url") or "0")
     await message.edit_text(
-        "🔵 <b>تنظیمات میکروتیک</b>\n\n"
-        f"فروش OpenVPN: <b>{'فعال ✅' if sales_enabled else 'غیرفعال ⛔'}</b>\n"
-        f"Mikrotik IP: <code>{html.escape(str(snap.get('api_ip') or ''))}</code>\n"
-        f"Mikrotik API Port: <code>{int(snap.get('api_port') or 0)}</code>\n"
-        f"Mikrotik Username: <code>{html.escape(str(snap.get('api_user') or ''))}</code>\n"
-        f"Mikrotik Password: <code>{html.escape(str(snap.get('api_pass') or ''))}</code>\n"
-        f"User Manager Connection Type: <b>{html.escape(str(snap.get('um_scheme') or '').upper())}</b>\n"
-        f"User Manager Path: <code>{html.escape(str(snap.get('um_path') or ''))}</code>",
+        admin_rtl_text("🔵 <b>میکروتیک و اوپن‌وی‌پی‌ان</b>\n\n"
+        f"فروش اوپن‌وی‌پی‌ان: <b>{'✅ فعال' if sales_enabled else '⛔ غیرفعال'}</b>\n"
+        f"آدرس روتر: <code>{html.escape(str(snap.get('api_ip') or ''))}</code>\n"
+        f"پورت روتر: <code>{int(snap.get('api_port') or 0)}</code>\n"
+        f"نوع اتصال یوزر منیجر: <b>{html.escape(str(snap.get('um_scheme') or '').upper())}</b>\n"
+        f"لینک راهنما: <b>{'⛔ غیرفعال' if openvpn_url == '0' else '✅ فعال'}</b>"),
         parse_mode="HTML",
+        disable_web_page_preview=True,
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton(
-                f"فروش OpenVPN: {'فعال ✅' if sales_enabled else 'غیرفعال ⛔'}",
+                f"فروش اوپن‌وی‌پی‌ان: {'✅ فعال' if sales_enabled else '⛔ غیرفعال'}",
                 callback_data="admin_service_sales|openvpn",
             )],
+            [InlineKeyboardButton("🧪 آزمایش اتصال", callback_data="admin_cfg_test|mikrotik")],
+            [InlineKeyboardButton("🔌 اتصال روتر", callback_data="admin_mt_connection")],
+            [InlineKeyboardButton("🛡 تنظیمات یوزر منیجر", callback_data="admin_um_settings")],
+            [InlineKeyboardButton("🔗 لینک راهنمای اتصال", callback_data="admin_cfg_edit|ovpnurl")],
+            [InlineKeyboardButton("🔙 بازگشت", callback_data="admin_connections_menu")],
+        ]),
+    )
+
+
+async def show_admin_mikrotik_connection(message, admin_tg_id: int):
+    if not is_admin(admin_tg_id):
+        return
+    snap = APP_SETTINGS.snapshot()
+    await message.edit_text(
+        admin_rtl_text(
+            "🔌 <b>اتصال روتر</b>\n\n"
+            f"Mikrotik IP: <code>{html.escape(str(snap.get('api_ip') or ''))}</code>\n"
+            f"Mikrotik API Port: <code>{int(snap.get('api_port') or 0)}</code>\n"
+            f"Mikrotik Username: <code>{html.escape(str(snap.get('api_user') or ''))}</code>\n"
+            f"Mikrotik Password: <code>{html.escape(str(snap.get('api_pass') or ''))}</code>"
+        ),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("Mikrotik IP", callback_data="admin_cfg_edit|mtip")],
             [InlineKeyboardButton("Mikrotik API Port", callback_data="admin_cfg_edit|mtport")],
             [InlineKeyboardButton("Mikrotik Username", callback_data="admin_cfg_edit|mtuser")],
             [InlineKeyboardButton("Mikrotik Password", callback_data="admin_cfg_edit|mtpass")],
+            [InlineKeyboardButton("🔙 بازگشت", callback_data="admin_cfg|mikrotik")],
+        ]),
+    )
+
+
+async def show_admin_um_settings(message, admin_tg_id: int):
+    if not is_admin(admin_tg_id):
+        return
+    snap = APP_SETTINGS.snapshot()
+    await message.edit_text(
+        admin_rtl_text(
+            "🛡 <b>تنظیمات یوزر منیجر</b>\n\n"
+            f"User Manager Connection Type: <b>{html.escape(str(snap.get('um_scheme') or '').upper())}</b>\n"
+            f"User Manager Path: <code>{html.escape(str(snap.get('um_path') or ''))}</code>"
+        ),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("User Manager Connection Type", callback_data="admin_cfg_edit|umscheme")],
             [InlineKeyboardButton("User Manager Path", callback_data="admin_cfg_edit|umpath")],
-            [InlineKeyboardButton("🧪 Test Connection", callback_data="admin_cfg_test|mikrotik")],
-            [InlineKeyboardButton("🔙 تنظیمات", callback_data="admin_settings_menu")],
+            [InlineKeyboardButton("🔙 بازگشت", callback_data="admin_cfg|mikrotik")],
         ]),
     )
 
@@ -1759,33 +1917,51 @@ async def show_admin_xui_settings(message, admin_tg_id: int):
     snap = APP_SETTINGS.snapshot()
     sales_enabled = bool(snap.get("v2ray_sales_enabled", True))
     await message.edit_text(
-        "🟣 <b>تنظیمات ثنایی</b>\n\n"
-        f"فروش V2ray: <b>{'فعال ✅' if sales_enabled else 'غیرفعال ⛔'}</b>\n"
-        f"XUI API Token: <code>{html.escape(_masked_secret(str(snap.get('xui_api_token') or '')))}</code>\n"
-        f"XUI Connection Type: <b>{html.escape(str(snap.get('xui_scheme') or '').upper())}</b>\n"
-        f"XUI IP: <code>{html.escape(str(snap.get('xui_host') or ''))}</code>\n"
-        f"XUI Panel Port: <code>{int(snap.get('xui_port') or 0)}</code>\n"
-        f"XUI Panel Path: <code>{html.escape(str(snap.get('xui_base_path') or ''))}</code>\n"
-        f"XUI TLS Verify: <b>{'Enabled' if snap.get('xui_verify_tls') else 'Disabled'}</b>\n"
-        f"Client Inbounds: <b>{len(inbound_records())}</b>\n"
-        f"Change Subscription URL: <code>{html.escape(str(snap.get('xui_sub_public_base') or '0'))}</code>",
+        admin_rtl_text("🟣 <b>پنل ثنایی و وی‌توری</b>\n\n"
+        f"فروش وی‌توری: <b>{'✅ فعال' if sales_enabled else '⛔ غیرفعال'}</b>\n"
+        f"آدرس پنل: <code>{html.escape(str(snap.get('xui_host') or ''))}</code>\n"
+        f"پورت پنل: <code>{int(snap.get('xui_port') or 0)}</code>\n"
+        f"اینباندهای فروش: <b>{len(inbound_records()):,}</b>\n"
+        f"آدرس عمومی اشتراک: <code>{html.escape(str(snap.get('xui_sub_public_base') or '0'))}</code>"),
         parse_mode="HTML",
         disable_web_page_preview=True,
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton(
-                f"فروش V2ray: {'فعال ✅' if sales_enabled else 'غیرفعال ⛔'}",
+                f"فروش وی‌توری: {'✅ فعال' if sales_enabled else '⛔ غیرفعال'}",
                 callback_data="admin_service_sales|v2ray",
             )],
+            [InlineKeyboardButton("🧪 آزمایش اتصال", callback_data="admin_cfg_test|xui")],
+            [InlineKeyboardButton("🔌 اتصال پنل", callback_data="admin_xui_connection")],
+            [InlineKeyboardButton("🛣 اینباندهای فروش", callback_data="admin_inbounds")],
+            [InlineKeyboardButton("🔗 آدرس عمومی اشتراک", callback_data="admin_cfg_edit|xusub")],
+            [InlineKeyboardButton("🔙 بازگشت", callback_data="admin_connections_menu")],
+        ]),
+    )
+
+
+async def show_admin_xui_connection(message, admin_tg_id: int):
+    if not is_admin(admin_tg_id):
+        return
+    snap = APP_SETTINGS.snapshot()
+    await message.edit_text(
+        admin_rtl_text(
+            "🔌 <b>اتصال پنل ثنایی</b>\n\n"
+            f"XUI API Token: <code>{html.escape(_masked_secret(str(snap.get('xui_api_token') or '')))}</code>\n"
+            f"XUI Connection Type: <b>{html.escape(str(snap.get('xui_scheme') or '').upper())}</b>\n"
+            f"XUI IP: <code>{html.escape(str(snap.get('xui_host') or ''))}</code>\n"
+            f"XUI Panel Port: <code>{int(snap.get('xui_port') or 0)}</code>\n"
+            f"XUI Panel Path: <code>{html.escape(str(snap.get('xui_base_path') or ''))}</code>\n"
+            f"XUI TLS Verify: <b>{'Enabled' if snap.get('xui_verify_tls') else 'Disabled'}</b>"
+        ),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("XUI API Token", callback_data="admin_cfg_edit|xutoken")],
             [InlineKeyboardButton("XUI Connection Type", callback_data="admin_cfg_edit|xuscheme")],
             [InlineKeyboardButton("XUI IP", callback_data="admin_cfg_edit|xuhost")],
             [InlineKeyboardButton("XUI Panel Port", callback_data="admin_cfg_edit|xuport")],
             [InlineKeyboardButton("XUI Panel Path", callback_data="admin_cfg_edit|xupath")],
             [InlineKeyboardButton("XUI TLS Verify", callback_data="admin_cfg_edit|xutls")],
-            [InlineKeyboardButton("Client Inbounds", callback_data="admin_inbounds")],
-            [InlineKeyboardButton("Change Subscription URL", callback_data="admin_cfg_edit|xusub")],
-            [InlineKeyboardButton("🧪 Test Connection", callback_data="admin_cfg_test|xui")],
-            [InlineKeyboardButton("🔙 تنظیمات", callback_data="admin_settings_menu")],
+            [InlineKeyboardButton("🔙 بازگشت", callback_data="admin_cfg|xui")],
         ]),
     )
 
@@ -1799,12 +1975,14 @@ async def show_admin_inbounds(message, admin_tg_id: int):
         for inbound_id, remark in records
     ]
     rows.extend([
-        [InlineKeyboardButton("➕ Add Inbound", callback_data="admin_inbound_add")],
-        [InlineKeyboardButton("🔙 تنظیمات ثنایی", callback_data="admin_cfg|xui")],
+        [InlineKeyboardButton("➕ افزودن اینباند", callback_data="admin_inbound_add")],
+        [InlineKeyboardButton("🔙 بازگشت", callback_data="admin_cfg|xui")],
     ])
-    text = "<b>Client Inbounds</b>\n\n"
-    text += "".join(f"• {html.escape(remark)}\n" for _, remark in records) or "هیچ Inbound ثبت نشده است."
-    await message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+    text = "🛣 <b>اینباندهای فروش</b>\n\n"
+    text += "".join(f"• {html.escape(remark)}\n" for _, remark in records) or "هنوز اینباندی ثبت نشده است."
+    await message.edit_text(
+        admin_rtl_text(text), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows)
+    )
 
 
 async def show_admin_inbound_detail(message, admin_tg_id: int, inbound_id: int):
@@ -1815,12 +1993,12 @@ async def show_admin_inbound_detail(message, admin_tg_id: int, inbound_id: int):
         await show_admin_inbounds(message, admin_tg_id)
         return
     await message.edit_text(
-        f"<b>Client Inbound</b>\n\n• {html.escape(found[1])}",
+        admin_rtl_text(f"🛣 <b>اینباند فروش</b>\n\n• {html.escape(found[1])}"),
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("✏️ Rename", callback_data=f"admin_inbound_rename|{found[0]}")],
-            [InlineKeyboardButton("🗑 Delete", callback_data=f"admin_inbound_delete|{found[0]}")],
-            [InlineKeyboardButton("🔙 Client Inbounds", callback_data="admin_inbounds")],
+            [InlineKeyboardButton("✏️ تغییر نام", callback_data=f"admin_inbound_rename|{found[0]}")],
+            [InlineKeyboardButton("🗑 حذف", callback_data=f"admin_inbound_delete|{found[0]}")],
+            [InlineKeyboardButton("🔙 بازگشت", callback_data="admin_inbounds")],
         ]),
     )
 
@@ -1831,10 +2009,10 @@ async def show_admin_zarinpal_settings(message, admin_tg_id: int):
     snap = APP_SETTINGS.snapshot()
     enabled = bool(snap.get("zarinpal_enabled", True))
     await message.edit_text(
-        "💳 <b>تنظیمات زرین‌پال</b>\n\n"
-        f"وضعیت: <b>{'فعال ✅' if enabled else 'غیرفعال ⛔'}</b>\n"
-        f"حالت Sandbox: <b>{'Enabled' if snap.get('zarinpal_sandbox') else 'Disabled'}</b>\n"
-        f"Merchant ID: <code>{html.escape(str(snap.get('zarinpal_merchant_id') or ''))}</code>",
+        admin_rtl_text("💳 <b>تنظیمات زرین‌پال</b>\n\n"
+        f"وضعیت: <b>{'✅ فعال' if enabled else '⛔ غیرفعال'}</b>\n"
+        f"حالت آزمایشی: <b>{'فعال' if snap.get('zarinpal_sandbox') else 'غیرفعال'}</b>\n"
+        f"شناسه پذیرنده: <code>{html.escape(str(snap.get('zarinpal_merchant_id') or ''))}</code>"),
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton(
@@ -1843,8 +2021,8 @@ async def show_admin_zarinpal_settings(message, admin_tg_id: int):
             )],
             [InlineKeyboardButton("حالت Sandbox", callback_data="admin_cfg_edit|zpsandbox")],
             [InlineKeyboardButton("Merchant ID", callback_data="admin_cfg_edit|zpmerchant")],
-            [InlineKeyboardButton("🧪 Test Connection", callback_data="admin_cfg_test|zarinpal")],
-            [InlineKeyboardButton("🔙 درگاه‌های پرداخت", callback_data="admin_gateways")],
+            [InlineKeyboardButton("🧪 آزمایش اتصال", callback_data="admin_cfg_test|zarinpal")],
+            [InlineKeyboardButton("🔙 بازگشت", callback_data="admin_gateways")],
         ]),
     )
 
@@ -1910,6 +2088,10 @@ async def show_admin_config_group(message, admin_tg_id: int, group: str):
         await show_admin_zarinpal_settings(message, admin_tg_id)
     elif group == "card":
         await show_admin_card_transfer_settings(message, admin_tg_id)
+    elif group == "referral":
+        await show_admin_referral_settings(message, admin_tg_id)
+    elif group == "notifications":
+        await show_admin_notification_settings(message, admin_tg_id)
 
 
 def _config_choice_markup(short_key: str, group: str) -> InlineKeyboardMarkup:
@@ -1939,24 +2121,38 @@ async def show_admin_backup_settings(message, admin_tg_id: int):
         return
     status = await run_blocking(auto_backup_status)
     enabled = bool(status.get("enabled"))
+    hour = int(status.get("hour", 6))
     last = status.get("last_backup") or {}
-    next_local = datetime.now(_backup_timezone()) + timedelta(seconds=_seconds_until_next_backup())
+    delivery = status.get("last_delivery") or {}
+    next_local = datetime.now(_backup_timezone()) + timedelta(
+        seconds=_seconds_until_next_backup(hour=hour)
+    )
+    delivered = bool(delivery.get("delivered_admin_ids")) and not bool(delivery.get("failed_admin_ids"))
+    delivery_text = "هنوز ارسال نشده"
+    if delivery.get("created_at"):
+        delivery_text = (
+            "ارسال شد ✅" if delivered else "ارسال ناموفق بود ❌"
+        ) + f" — {_format_backup_time(str(delivery.get('created_at') or ''))}"
     await message.edit_text(
-        "💾 <b>بکاپ خودکار دیتابیس</b>\n\n"
-        f"وضعیت: <b>{'روشن ✅' if enabled else 'خاموش ❌'}</b>\n"
-        f"زمان اجرا: <b>هر روز ساعت {APP_BACKUP_HOUR:02d}:00</b>\n"
+        admin_rtl_text(
+        "💾 <b>بکاپ و بازیابی</b>\n\n"
+        f"وضعیت بکاپ خودکار: <b>{'فعال ✅' if enabled else 'غیرفعال ⛔'}</b>\n"
+        f"زمان اجرا: <b>هر روز ساعت {hour:02d}:00</b>\n"
         f"آخرین بکاپ خودکار: <b>{html.escape(_format_backup_time(str(last.get('created_at') or '')))}</b>\n"
+        f"آخرین ارسال به مدیر: <b>{html.escape(delivery_text)}</b>\n"
         f"بکاپ بعدی زمان‌بندی‌شده: <b>{next_local.strftime('%Y-%m-%d %H:%M')}</b>\n"
         f"تعداد فایل‌های نگهداری‌شده: <b>{BACKUP_KEEP}</b>\n\n"
-        "بکاپ در صف مستقل اجرا می‌شود و پردازش کاربران را اشغال نمی‌کند.",
+        "فایل بکاپ خودکار پس از ساخته‌شدن برای مدیر اصلی ارسال می‌شود."
+        ),
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton(
-                "❌ خاموش کردن بکاپ خودکار" if enabled else "✅ روشن کردن بکاپ خودکار",
+                "⛔ غیرفعال‌کردن بکاپ خودکار" if enabled else "✅ فعال‌کردن بکاپ خودکار",
                 callback_data=f"admin_auto_backup_set|{0 if enabled else 1}",
             )],
-            [InlineKeyboardButton("💾 بکاپ فوری", callback_data="admin_backup")],
-            [InlineKeyboardButton("🔙 تنظیمات", callback_data="admin_settings_menu")],
+            [InlineKeyboardButton("🕒 تغییر ساعت بکاپ", callback_data="admin_backup_hour")],
+            [InlineKeyboardButton("💾 دریافت بکاپ فوری", callback_data="admin_backup")],
+            [InlineKeyboardButton("🔙 سیستم و نگهداری", callback_data="admin_system_menu")],
         ]),
     )
 
@@ -1996,7 +2192,7 @@ def _admin_plan_list_keyboard(service: str | int, page: int | None = None, page_
     if nav:
         rows.append(nav)
     rows.append([InlineKeyboardButton("➕ افزودن بسته", callback_data=f"admin_plan_add|{service}")])
-    rows.append([InlineKeyboardButton("🔙 مدیریت بسته‌ها", callback_data="admin_plans|0")])
+    rows.append([InlineKeyboardButton("🔙 بازگشت", callback_data="admin_sales_menu")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -2020,13 +2216,15 @@ async def show_admin_plans(message, admin_tg_id: int, page: int = 0):
             f"🎁 بسته تست | {int(TEST_PLAN.get('gb') or 0)}GB | {trial_state}"[:64],
             callback_data="admin_trial_view",
         )],
-        [InlineKeyboardButton("🔙 تنظیمات", callback_data="admin_settings_menu")],
+        [InlineKeyboardButton("🔙 بازگشت", callback_data="admin_tools")],
     ])
     await message.edit_text(
-        "📦 <b>مدیریت بسته‌ها</b>\n\n"
+        admin_rtl_text("📦 <b>فروش و بسته‌ها</b>\n\n"
+        f"🔵 فروش اوپن‌وی‌پی‌ان: <b>{'✅ فعال' if service_sales_enabled('openvpn') else '⛔ غیرفعال'}</b>\n"
+        f"🟣 فروش وی‌توری: <b>{'✅ فعال' if service_sales_enabled('v2ray') else '⛔ غیرفعال'}</b>\n\n"
         "بسته‌های فروش OpenVPN و V2Ray مستقل هستند.\n"
         "بسته‌های سرویس غیرفعال در این بخش نمایش داده نمی‌شوند؛ اطلاعات آن‌ها در دیتابیس محفوظ می‌ماند.\n\n"
-        f"اکانت تست: <b>{'فعال' if test_plan_enabled() else 'غیرفعال'}</b>",
+        f"اکانت تست: <b>{'✅ فعال' if test_plan_enabled() else '⛔ غیرفعال'}</b>"),
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(rows),
     )
@@ -2052,7 +2250,7 @@ async def show_admin_service_plans(message, admin_tg_id: int, service: str, page
     if not registry:
         text += "\n\n⚠️ هنوز بسته‌ای برای این سرویس تعریف نشده است."
     await message.edit_text(
-        text, parse_mode="HTML",
+        admin_rtl_text(text), parse_mode="HTML",
         reply_markup=_admin_plan_list_keyboard(service, page),
     )
 
@@ -2081,7 +2279,7 @@ async def show_admin_trial_detail(message, admin_tg_id: int):
                 "⛔ غیرفعال‌کردن تست" if enabled else "✅ فعال‌کردن تست",
                 callback_data=f"admin_trial_toggle|{0 if enabled else 1}",
             )],
-            [InlineKeyboardButton("🔙 بسته‌ها", callback_data="admin_plans|0")],
+            [InlineKeyboardButton("🔙 بازگشت", callback_data="admin_sales_menu")],
         ]),
     )
 
@@ -2145,22 +2343,25 @@ async def show_admin_referral_settings(message, admin_tg_id: int):
     discount = current_referral_discount_percent()
     reward = current_referral_reward_percent()
     enabled = referral_enabled()
+    prefix = str(APP_SETTINGS.get("referral_code_prefix", "DG") or "DG")
     await message.edit_text(
-        "🎁 <b>تنظیمات Referral</b>\n\n"
-        f"وضعیت: <b>{'فعال ✅' if enabled else 'غیرفعال ⛔'}</b>\n"
+        admin_rtl_text("🎁 <b>تنظیمات معرفی</b>\n\n"
+        f"وضعیت: <b>{'✅ فعال' if enabled else '⛔ غیرفعال'}</b>\n"
+        f"پیشوند کد معرفی: <code>{html.escape(prefix)}</code>\n"
         f"پاداش خریدار / تخفیف خرید اول: <b>{discount}%</b>\n"
         f"پاداش معرف: <b>{reward}%</b>\n\n"
-        "در حالت غیرفعال، کد معرف و پیام تخفیف خرید اول به کاربران نمایش داده نمی‌شود.",
+        "در حالت غیرفعال، کد معرف و پیام تخفیف خرید اول به کاربران نمایش داده نمی‌شود."),
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton(
-                "⛔ غیرفعال‌کردن Referral" if enabled else "✅ فعال‌کردن Referral",
+                "⛔ غیرفعال کردن معرفی" if enabled else "✅ فعال کردن معرفی",
                 callback_data="admin_feature_toggle|referral",
             )],
+            [InlineKeyboardButton("✏️ پیشوند کد معرفی", callback_data="admin_cfg_edit|refpre")],
             [InlineKeyboardButton("✏️ درصد پاداش خریدار", callback_data="admin_referral_edit|discount")],
             [InlineKeyboardButton("✏️ درصد پاداش معرف", callback_data="admin_referral_edit|reward")],
-            [InlineKeyboardButton("📊 گزارش Referral", callback_data="admin_referral_report")],
-            [InlineKeyboardButton("🔙 تنظیمات", callback_data="admin_settings_menu")],
+            [InlineKeyboardButton("📊 گزارش معرفی", callback_data="admin_referral_report")],
+            [InlineKeyboardButton("🔙 بازگشت", callback_data="admin_marketing_menu")],
         ]),
     )
 
@@ -2175,9 +2376,9 @@ async def show_admin_wallet_settings(message, admin_tg_id: int):
         if referral_is_enabled else ""
     )
     await message.edit_text(
-        "💰 <b>تنظیمات کیف پول</b>\n\n"
-        f"وضعیت: <b>{'فعال ✅' if enabled else 'غیرفعال ⛔'}</b>"
-        f"{dependency}",
+        admin_rtl_text("💰 <b>تنظیمات کیف پول</b>\n\n"
+        f"وضعیت: <b>{'✅ فعال' if enabled else '⛔ غیرفعال'}</b>"
+        f"{dependency}"),
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton(
@@ -2186,7 +2387,7 @@ async def show_admin_wallet_settings(message, admin_tg_id: int):
             )],
             [InlineKeyboardButton("👤 مدیریت کیف پول کاربران", callback_data="admin_wallet_manage")],
             [InlineKeyboardButton("💰 کیف پول‌های دارای موجودی", callback_data="admin_wallet_pos|0")],
-            [InlineKeyboardButton("🔙 تنظیمات", callback_data="admin_settings_menu")],
+            [InlineKeyboardButton("🔙 بازگشت", callback_data="admin_marketing_menu")],
         ]),
     )
 
@@ -2514,16 +2715,13 @@ def admin_user_detail_keyboard(summary: dict):
         [InlineKeyboardButton("💰 مدیریت کیف پول", callback_data=f"admin_wallet_user|{tg_id}")],
         [InlineKeyboardButton("🧾 تراکنش‌های این کاربر", callback_data=f"admin_user_tx|{tg_id}|0")],
     ]
-    for account in (summary.get("accounts") or [])[:90]:
-        service = str(account.get("service") or "")
-        identifier = str(account.get("identifier") or "")
-        if service in SERVICE_LABEL and identifier:
-            icon = "🔵" if service == "openvpn" else "🟣"
-            rows.append([InlineKeyboardButton(
-                f"{icon} {identifier}"[:64],
-                callback_data=f"admacc_ref|{service}|{tg_id}|{account_ref(identifier)}",
-            )])
-    rows.append([InlineKeyboardButton("🔙 کاربران", callback_data="admin_users_menu")])
+    account_count = len(summary.get("accounts") or [])
+    if account_count:
+        rows.append([InlineKeyboardButton(
+            f"🔐 مشاهده اکانت‌ها ({account_count})",
+            callback_data=f"admin_user_accounts|{tg_id}|0",
+        )])
+    rows.append([InlineKeyboardButton("🔙 بازگشت", callback_data="admin_users_menu")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -2560,24 +2758,56 @@ async def show_admin_user_detail(message, admin_tg_id: int, user_tg_id: int):
         text += f"🎁 کد معرف: <code>{html.escape(str(ref.get('code')))}</code>\n"
     if ref.get("used_code"):
         text += f"🎟 کد استفاده‌شده: <code>{html.escape(str(ref.get('used_code')))}</code>\n"
-    if summary.get("accounts"):
-        text += "\n<b>اکانت‌ها:</b>\n"
-        shown = 0
-        for a in summary["accounts"]:
-            identifier = str(a.get("identifier") or "")
-            block = (
-                f"• {html.escape(SERVICE_LABEL.get(str(a.get('service')), str(a.get('service'))))}: "
-                f"<code>{html.escape(identifier[:256])}</code>"
-                f"{' (تست)' if a.get('is_test') else ''}\n"
-            )
-            if len(text) + len(block) > 3600:
-                break
-            text += block
-            shown += 1
-        omitted = len(summary["accounts"]) - shown
-        if omitted:
-            text += f"<i>{omitted} اکانت دیگر برای حفظ محدودیت پیام تلگرام نمایش داده نشد.</i>"
-    await message.edit_text(text, parse_mode="HTML", reply_markup=admin_user_detail_keyboard(summary), disable_web_page_preview=True)
+    await message.edit_text(
+        admin_rtl_text(text), parse_mode="HTML",
+        reply_markup=admin_user_detail_keyboard(summary), disable_web_page_preview=True,
+    )
+
+
+async def show_admin_user_accounts(
+    message, admin_tg_id: int, user_tg_id: int, page: int = 0, page_size: int = 8
+):
+    if not is_admin(admin_tg_id):
+        return
+    summary = await run_blocking(get_user_admin_summary, user_tg_id)
+    if not summary:
+        await show_admin_users_menu(message, admin_tg_id)
+        return
+    accounts = list(summary.get("accounts") or [])
+    total = len(accounts)
+    max_page = max((total - 1) // page_size, 0) if total else 0
+    page = min(max(int(page or 0), 0), max_page)
+    start = page * page_size
+    rows = []
+    for account in accounts[start:start + page_size]:
+        service = str(account.get("service") or "")
+        identifier = str(account.get("identifier") or "")
+        if service not in SERVICE_LABEL or not identifier:
+            continue
+        icon = "🔵" if service == "openvpn" else "🟣"
+        suffix = " — تست" if account.get("is_test") else ""
+        rows.append([InlineKeyboardButton(
+            f"{icon} {identifier}{suffix}"[:64],
+            callback_data=f"admacc_ref|{service}|{user_tg_id}|{account_ref(identifier)}",
+        )])
+    nav = []
+    if start + page_size < total:
+        nav.append(InlineKeyboardButton("⬅️ قدیمی‌تر", callback_data=f"admin_user_accounts|{user_tg_id}|{page + 1}"))
+    if page > 0:
+        nav.append(InlineKeyboardButton("جدیدتر ➡️", callback_data=f"admin_user_accounts|{user_tg_id}|{page - 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("🔙 بازگشت", callback_data=f"admin_user|{user_tg_id}")])
+    text = (
+        f"🔐 <b>اکانت‌های کاربر</b>\n\n"
+        f"کاربر: <b>{html.escape(str(summary.get('label') or user_tg_id))}</b>\n"
+        f"تعداد اکانت‌ها: <b>{total:,}</b>\n"
+        f"صفحه: <b>{page + 1} از {max_page + 1 if total else 1}</b>\n\n"
+        + ("اکانت موردنظر را انتخاب کنید." if total else "این کاربر هنوز اکانتی ندارد.")
+    )
+    await message.edit_text(
+        admin_rtl_text(text), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows)
+    )
 
 
 def admin_user_tx_keyboard(tg_id: int, page: int, total: int, page_size: int = 5):
@@ -3008,6 +3238,13 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await show_admin_reports_menu(q.message, q.from_user.id)
             return
 
+        if data == "admin_sales_menu":
+            if not is_admin(q.from_user.id):
+                return
+            context.user_data.clear()
+            await show_admin_plans(q.message, q.from_user.id)
+            return
+
         if data == "admin_dashboard":
             if not is_admin(q.from_user.id):
                 return
@@ -3038,6 +3275,45 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             context.user_data.clear()
             await show_admin_settings_menu(q.message, q.from_user.id)
+            return
+
+        if data == "admin_connections_menu":
+            if not is_admin(q.from_user.id):
+                return
+            context.user_data.clear()
+            await show_admin_connections_menu(q.message, q.from_user.id)
+            return
+
+        if data == "admin_marketing_menu":
+            if not is_admin(q.from_user.id):
+                return
+            context.user_data.clear()
+            await show_admin_marketing_menu(q.message, q.from_user.id)
+            return
+
+        if data == "admin_notification_settings":
+            if not is_admin(q.from_user.id):
+                return
+            context.user_data.clear()
+            await show_admin_notification_settings(q.message, q.from_user.id)
+            return
+
+        if data == "admin_mt_connection":
+            if not is_admin(q.from_user.id):
+                return
+            await show_admin_mikrotik_connection(q.message, q.from_user.id)
+            return
+
+        if data == "admin_um_settings":
+            if not is_admin(q.from_user.id):
+                return
+            await show_admin_um_settings(q.message, q.from_user.id)
+            return
+
+        if data == "admin_xui_connection":
+            if not is_admin(q.from_user.id):
+                return
+            await show_admin_xui_connection(q.message, q.from_user.id)
             return
 
         if data == "admin_wallet_settings":
@@ -3117,7 +3393,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 admin_tg_id=q.from_user.id, _lane="db",
             )
             _wake_account_expiry_monitor()
-            await show_admin_bot_settings(q.message, q.from_user.id)
+            await show_admin_notification_settings(q.message, q.from_user.id)
             return
 
         if parts[0] == "admin_service_sales" and len(parts) == 2:
@@ -3160,6 +3436,15 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             context.user_data.pop("awaiting", None)
             await show_admin_reseller_detail(q.message, q.from_user.id, int(parts[1]))
+            return
+
+        if parts[0] == "rseditmenu" and len(parts) == 2:
+            if not is_admin(q.from_user.id):
+                return
+            context.user_data.pop("awaiting", None)
+            await show_admin_reseller_edit_menu(
+                q.message, q.from_user.id, int(parts[1])
+            )
             return
 
         if data == "rsadd":
@@ -3562,7 +3847,26 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await run_blocking(
                 set_auto_backup_enabled, desired, admin_tg_id=q.from_user.id
             )
+            _wake_backup_scheduler()
             await show_admin_backup_settings(q.message, q.from_user.id)
+            return
+
+        if data == "admin_backup_hour":
+            if not is_admin(q.from_user.id):
+                return
+            context.user_data["awaiting"] = {"kind": "admin_backup_hour"}
+            await q.message.edit_text(
+                admin_rtl_text(
+                    "🕒 <b>تغییر ساعت بکاپ خودکار</b>\n\n"
+                    "یک عدد صحیح بین ۰ تا ۲۴ ارسال کنید.\n"
+                    "برای مثال، عدد ۱۶ یعنی هر روز ساعت ۱۶:۰۰.\n"
+                    "مقادیر ۰ و ۲۴ هر دو به معنی نیمه‌شب هستند."
+                ),
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("❌ انصراف", callback_data="admin_backup_settings")
+                ]]),
+            )
             return
 
         if data == "admin_plans" or (parts[0] == "admin_plans" and len(parts) == 2):
@@ -4127,6 +4431,14 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await show_admin_user_detail(q.message, q.from_user.id, int(parts[1]))
             return
 
+        if parts[0] == "admin_user_accounts" and len(parts) == 3:
+            if not is_admin(q.from_user.id):
+                return
+            await show_admin_user_accounts(
+                q.message, q.from_user.id, int(parts[1]), int(parts[2])
+            )
+            return
+
         if parts[0] == "admin_user_tx" and len(parts) == 3:
             if not is_admin(q.from_user.id):
                 return
@@ -4148,7 +4460,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 admin_tg_id=q.from_user.id,
             )
             _apply_maintenance_mode(after)
-            await show_admin_settings_menu(q.message, q.from_user.id)
+            await show_admin_system_menu(q.message, q.from_user.id)
             return
 
         if parts[0] == "admin_maintenance_set" and len(parts) == 2:
@@ -4159,7 +4471,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 set_maintenance_mode, desired, admin_tg_id=q.from_user.id
             )
             _apply_maintenance_mode(after)
-            await show_admin_settings_menu(q.message, q.from_user.id)
+            await show_admin_system_menu(q.message, q.from_user.id)
             return
 
         if data in {"admin_health", "admin_health_live"}:
@@ -5047,6 +5359,42 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data.clear()
             await update.message.reply_text(MAINTENANCE_MESSAGE, reply_markup=await main_menu_keyboard(update.effective_user.id))
             return
+
+    if awaiting.get("kind") == "admin_backup_hour":
+        if not is_admin(update.effective_user.id):
+            return
+        try:
+            hour = int(value)
+            if hour < 0 or hour > 24:
+                raise ValueError("ساعت بکاپ باید بین ۰ تا ۲۴ باشد")
+            await run_blocking(
+                set_auto_backup_hour, hour,
+                admin_tg_id=update.effective_user.id, _lane="db",
+            )
+        except (TypeError, ValueError) as exc:
+            context.user_data["awaiting"] = awaiting
+            await update.message.reply_text(
+                admin_rtl_text(
+                    f"❌ {html.escape(str(exc))}\n"
+                    "لطفاً فقط یک عدد صحیح بین ۰ تا ۲۴ ارسال کنید."
+                ),
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("❌ انصراف", callback_data="admin_backup_settings")
+                ]]),
+            )
+            return
+        _wake_backup_scheduler()
+        await update.message.reply_text(
+            admin_rtl_text(
+                f"✅ ساعت بکاپ خودکار روی <b>{hour:02d}:00</b> تنظیم شد."
+            ),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 بکاپ و بازیابی", callback_data="admin_backup_settings")
+            ]]),
+        )
+        return
 
     if awaiting.get("kind") == "admin_config_value":
         if not is_admin(update.effective_user.id):
@@ -7564,33 +7912,111 @@ async def _account_expiry_monitor_loop(application, wake: asyncio.Event):
             await asyncio.sleep(60)
 
 
+def _wake_backup_scheduler():
+    wake = _BACKUP_SCHEDULER_WAKE
+    if wake is not None:
+        wake.set()
+
+
 def _backup_timezone():
     try:
         return ZoneInfo(APP_TIMEZONE)
     except Exception:
-        # Iran no longer observes DST; this fallback keeps 06:00 deterministic
-        # even on a minimal Ubuntu installation without system tzdata.
+        # Iran no longer observes DST; this keeps the configured wall-clock
+        # backup hour deterministic on a minimal Ubuntu install without tzdata.
         logger.warning("timezone %s unavailable; using UTC+03:30 for backups", APP_TIMEZONE)
         return timezone(timedelta(hours=3, minutes=30))
 
 
-def _seconds_until_next_backup(now: datetime | None = None) -> float:
+def _seconds_until_next_backup(
+    now: datetime | None = None, hour: int | None = None
+) -> float:
     tz = _backup_timezone()
     current = now.astimezone(tz) if now is not None else datetime.now(tz)
-    target = current.replace(hour=APP_BACKUP_HOUR, minute=0, second=0, microsecond=0)
+    selected = auto_backup_hour() if hour is None else int(hour)
+    if selected < 0 or selected > 24:
+        selected = 6
+    target = current.replace(hour=0 if selected == 24 else selected, minute=0, second=0, microsecond=0)
     if target <= current:
         target += timedelta(days=1)
     return max((target - current).total_seconds(), 1.0)
 
 
-async def _backup_loop():
-    # The task itself is intentionally always alive so changing the persistent
-    # admin switch takes effect without restarting the service. While waiting
-    # it consumes no worker thread and essentially no CPU.
+async def _send_scheduled_backup(application, result: dict) -> dict:
+    path = str(result.get("path") or "")
+    filename = os.path.basename(path) or "vpn_bot_v2.sqlite3"
+    size_bytes = int(result.get("size_bytes") or 0)
+    delivered = []
+    failed = []
+    for admin_id in effective_admin_ids():
+        sent = False
+        for attempt in range(3):
+            try:
+                with open(path, "rb") as fp:
+                    await application.bot.send_document(
+                        chat_id=int(admin_id),
+                        document=InputFile(fp, filename=filename),
+                        caption=admin_rtl_text(
+                            "💾 <b>بکاپ خودکار دیتابیس</b>\n\n"
+                            f"زمان ایجاد: <b>{_format_backup_time(str(result.get('created_at') or ''))}</b>\n"
+                            f"حجم فایل: <b>{human_bytes(size_bytes)}</b>"
+                        ),
+                        parse_mode="HTML",
+                    )
+                delivered.append(int(admin_id))
+                sent = True
+                break
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "scheduled backup delivery failed admin=%s attempt=%d error=%s",
+                    admin_id, attempt + 1, type(exc).__name__,
+                )
+                if attempt < 2:
+                    await asyncio.sleep(2 ** attempt)
+        if not sent:
+            failed.append(int(admin_id))
+    delivery = await run_blocking(
+        record_auto_backup_delivery,
+        filename=filename,
+        size_bytes=size_bytes,
+        delivered_admin_ids=tuple(delivered),
+        failed_admin_ids=tuple(failed),
+        _lane="db",
+    )
+    await run_blocking(
+        record_admin_audit,
+        admin_tg_id=0,
+        action="automatic_backup_delivery",
+        meta={
+            "filename": filename,
+            "size_bytes": size_bytes,
+            "delivered_count": len(delivered),
+            "failed_count": len(failed),
+        },
+        _lane="db",
+    )
+    return delivery
+
+
+async def _backup_loop(application, wake: asyncio.Event):
+    # The lightweight scheduler is interruptible so toggle/hour changes become
+    # active immediately without restarting the process.
     while True:
         try:
-            await asyncio.sleep(_seconds_until_next_backup())
-            if not (await run_blocking(auto_backup_enabled)):
+            status = await run_blocking(auto_backup_status, _lane="db")
+            enabled = bool(status.get("enabled"))
+            hour = int(status.get("hour", 6))
+            delay = _seconds_until_next_backup(hour=hour) if enabled else 3600
+            try:
+                await asyncio.wait_for(wake.wait(), timeout=delay)
+                wake.clear()
+                continue
+            except asyncio.TimeoutError:
+                pass
+            fresh = await run_blocking(auto_backup_status, _lane="db")
+            if not bool(fresh.get("enabled")):
                 logger.info("scheduled SQLite backup skipped: disabled by admin")
                 continue
             result = await run_blocking(
@@ -7598,6 +8024,7 @@ async def _backup_loop():
             )
             if result.get("created"):
                 logger.info("scheduled SQLite backup created: %s", result.get("path"))
+                await _send_scheduled_backup(application, result)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -7607,7 +8034,7 @@ async def _backup_loop():
 
 
 async def post_init(application):
-    global _ACCOUNT_EXPIRY_MONITOR_WAKE
+    global _ACCOUNT_EXPIRY_MONITOR_WAKE, _BACKUP_SCHEDULER_WAKE
     RUNTIME.heartbeat()
     if WATCHDOG_ENABLED:
         RUNTIME.start_watchdog(WATCHDOG_STALE_SECONDS, logger=logger)
@@ -7615,9 +8042,10 @@ async def post_init(application):
         asyncio.create_task(_heartbeat_loop(), name="heartbeat"),
         asyncio.create_task(_health_probe_loop(), name="health-probe"),
     ]
-    # Always keep the lightweight scheduler task alive; the persistent admin
-    # switch decides whether the 06:00 backup actually runs.
-    tasks.append(asyncio.create_task(_backup_loop(), name="sqlite-backup"))
+    _BACKUP_SCHEDULER_WAKE = asyncio.Event()
+    tasks.append(asyncio.create_task(
+        _backup_loop(application, _BACKUP_SCHEDULER_WAKE), name="sqlite-backup"
+    ))
     _ACCOUNT_EXPIRY_MONITOR_WAKE = asyncio.Event()
     tasks.append(asyncio.create_task(
         _account_expiry_monitor_loop(application, _ACCOUNT_EXPIRY_MONITOR_WAKE),
@@ -7633,7 +8061,7 @@ async def post_init(application):
         )
     application.bot_data["background_tasks"] = tasks
     logger.info(
-        "Account Sales Bot v1.0.1 runtime initialized watchdog=%s sqlite=%s cache_ttl=%.1fs workers=%d queue_cap=%d "
+        "Account Sales Bot v1.1.0 runtime initialized watchdog=%s sqlite=%s cache_ttl=%.1fs workers=%d queue_cap=%d "
         "lanes=misc:%d,db:%d,mikrotik:%d,xui:%d,zarinpal:%d read_deadline=%.1fs",
         WATCHDOG_ENABLED, (await run_blocking(database_stats)).get("quick_check"), STATUS_CACHE_TTL_SECONDS,
         BOT_CONCURRENT_UPDATES, BOT_UPDATE_QUEUE_CAP,
@@ -7643,13 +8071,14 @@ async def post_init(application):
 
 
 async def post_shutdown(application):
-    global _ACCOUNT_EXPIRY_MONITOR_WAKE
+    global _ACCOUNT_EXPIRY_MONITOR_WAKE, _BACKUP_SCHEDULER_WAKE
     RUNTIME.stop_watchdog()
     for task in application.bot_data.get("background_tasks", []):
         task.cancel()
     if application.bot_data.get("background_tasks"):
         await asyncio.gather(*application.bot_data["background_tasks"], return_exceptions=True)
     _ACCOUNT_EXPIRY_MONITOR_WAKE = None
+    _BACKUP_SCHEDULER_WAKE = None
     for lane in BLOCKING_LANES.values():
         lane.shutdown()
 
@@ -7690,7 +8119,7 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, card_receipt_media_router))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
     app.add_error_handler(error_handler)
-    logger.info("Account Sales Bot v1.0.0 started")
+    logger.info("Account Sales Bot v1.1.0 started")
     app.run_polling(
         allowed_updates=[Update.MESSAGE, Update.CALLBACK_QUERY],
         bootstrap_retries=-1,
