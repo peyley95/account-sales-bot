@@ -10,6 +10,7 @@ import time
 import secrets
 import functools
 import threading
+import tempfile
 from types import MappingProxyType
 from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
@@ -22,7 +23,7 @@ from telegram.error import BadRequest
 from telegram.ext import ApplicationBuilder, BaseUpdateProcessor, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from config import (
-    BOT_TOKEN, REFERRAL_DISCOUNT_PERCENT,
+    APP_VERSION, BOT_TOKEN, REFERRAL_DISCOUNT_PERCENT,
     REFERRAL_REWARD_PERCENT, XUI_LOCATION_LABELS, BOT_CONCURRENT_UPDATES,
     BOT_UPDATE_QUEUE_CAP, BOT_IO_WORKERS, BOT_DB_WORKERS,
     BOT_MIKROTIK_WORKERS, BOT_XUI_WORKERS, BOT_ZARINPAL_WORKERS,
@@ -44,11 +45,13 @@ from app_settings import (
     enabled_sales_services, service_sales_enabled, set_service_sales_enabled,
     enabled_payment_gateways, payment_gateway_enabled, set_payment_gateway_enabled,
     referral_enabled, wallet_enabled, set_referral_enabled, set_wallet_enabled,
+    initialize_runtime_settings,
 )
 from account_notifications import classify_openvpn_status, classify_v2ray_status
 from plans import (
     TEST_PLAN, price_rial, gb_to_bytes, plan_snapshot, plans_for, refresh_plans,
     refresh_test_plan, test_plan_enabled, pending_plan_is_stale, snapshot_for_delivery,
+    reload_plan_registries,
 )
 from storage import (
     list_accounts, upsert_account, has_test, mark_test,
@@ -93,6 +96,10 @@ from services.zarinpal import (
     verify_payment_for_cancel, test_connection as test_zarinpal_connection,
 )
 from runtime import STATUS_CACHE, RUNTIME, CallbackRateLimiter, TTLCache
+from restore_manager import (
+    MAX_RESTORE_FILE_BYTES, RestoreValidationError, inspect_database_backup,
+    restore_database_backup, rollback_to_safety_backup,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("account-sales-bot")
@@ -100,6 +107,9 @@ logger = logging.getLogger("account-sales-bot")
 SERVICE_LABEL = {"openvpn": "OpenVPN", "v2ray": "V2Ray"}
 _ACCOUNT_EXPIRY_MONITOR_WAKE = None
 _BACKUP_SCHEDULER_WAKE = None
+_DATABASE_RESTORE_IN_PROGRESS = threading.Event()
+_DATABASE_RESTORE_QUIESCE_SECONDS = 60.0
+_BACKGROUND_DATA_ACTIVITY = 0
 _RLM = "\u200f"
 
 
@@ -2116,6 +2126,105 @@ def _format_backup_time(value: str) -> str:
         return str(value)[:19]
 
 
+def _is_root_admin(tg_id: int) -> bool:
+    try:
+        return int(tg_id) > 0 and int(tg_id) == int(root_admin_id())
+    except (TypeError, ValueError):
+        return False
+
+
+def _restore_preview_from_context(context, token: str = "") -> dict:
+    state = dict(context.user_data.get("database_restore_preview") or {})
+    if token and str(state.get("token") or "") != str(token):
+        return {}
+    if time.monotonic() - float(state.get("uploaded_monotonic") or 0) > 15 * 60:
+        return {}
+    path = str(state.get("path") or "")
+    if not path or not os.path.isfile(path):
+        return {}
+    return state
+
+
+async def _cleanup_restore_preview(context):
+    state = dict(context.user_data.pop("database_restore_preview", None) or {})
+    temp_dir = str(state.get("temp_dir") or "")
+    if temp_dir:
+        await run_blocking(shutil.rmtree, temp_dir, True, _lane="backup")
+
+
+async def _wait_for_restore_quiescence(timeout: float = _DATABASE_RESTORE_QUIESCE_SECONDS):
+    """Wait until this callback is the only active Telegram update and lanes are idle."""
+    deadline = time.monotonic() + max(float(timeout), 1.0)
+    stable_since = None
+    while time.monotonic() < deadline:
+        lane_active = sum(
+            int(lane.snapshot().get("active") or 0)
+            for lane in BLOCKING_LANES.values()
+        )
+        quiet = (
+            int(RUNTIME.snapshot().get("in_flight") or 0) <= 1
+            and lane_active == 0
+            and int(_BACKGROUND_DATA_ACTIVITY) == 0
+        )
+        if quiet:
+            stable_since = stable_since or time.monotonic()
+            if time.monotonic() - stable_since >= 0.25:
+                return
+        else:
+            stable_since = None
+        await asyncio.sleep(0.05)
+    raise RuntimeError("عملیات‌های در حال اجرا در زمان امن متوقف نشدند؛ دوباره تلاش کنید")
+
+
+@asynccontextmanager
+async def _background_data_activity():
+    global _BACKGROUND_DATA_ACTIVITY
+    _BACKGROUND_DATA_ACTIVITY += 1
+    try:
+        yield
+    finally:
+        _BACKGROUND_DATA_ACTIVITY = max(_BACKGROUND_DATA_ACTIVITY - 1, 0)
+
+
+def _reload_runtime_after_database_restore() -> dict:
+    """Synchronously rebuild every DB-backed in-memory snapshot."""
+    initialize_runtime_settings(root_admin_id=root_admin_id())
+    plan_state = reload_plan_registries()
+    referral_state = get_referral_settings(
+        default_discount_percent=REFERRAL_DISCOUNT_PERCENT,
+        default_reward_percent=REFERRAL_REWARD_PERCENT,
+    )
+    _apply_referral_settings(referral_state)
+    maintenance = bool(maintenance_mode())
+    _apply_maintenance_mode(maintenance)
+    return {"plans": plan_state, "maintenance": maintenance}
+
+
+def _clear_runtime_caches_after_restore(application):
+    STATUS_CACHE.invalidate()
+    _PURCHASE_STATUS_CACHE.invalidate()
+    PROFILE_SAVE_CACHE.invalidate()
+    for user_data in list(getattr(application, "user_data", {}).values()):
+        try:
+            user_data.clear()
+        except Exception:
+            continue
+
+
+async def _database_restore_busy_reply(update: Update) -> bool:
+    if not _DATABASE_RESTORE_IN_PROGRESS.is_set():
+        return False
+    text = "⏳ بازیابی دیتابیس در حال انجام است؛ لطفاً چند لحظه صبر کنید."
+    query = getattr(update, "callback_query", None)
+    if query is not None:
+        await safe_callback_answer(query, text, show_alert=True)
+    else:
+        message = getattr(update, "effective_message", None)
+        if message is not None:
+            await message.reply_text(text)
+    return True
+
+
 async def show_admin_backup_settings(message, admin_tg_id: int):
     if not is_admin(admin_tg_id):
         return
@@ -2152,6 +2261,7 @@ async def show_admin_backup_settings(message, admin_tg_id: int):
             )],
             [InlineKeyboardButton("🕒 تغییر ساعت بکاپ", callback_data="admin_backup_hour")],
             [InlineKeyboardButton("💾 دریافت بکاپ فوری", callback_data="admin_backup")],
+            [InlineKeyboardButton("♻️ بازیابی بکاپ", callback_data="admin_restore_begin")],
             [InlineKeyboardButton("🔙 سیستم و نگهداری", callback_data="admin_system_menu")],
         ]),
     )
@@ -3093,6 +3203,8 @@ async def show_reseller_debt(message, tg_id: int):
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await _database_restore_busy_reply(update):
+        return
     schedule_telegram_profile(context, update.effective_user)
     context.user_data.clear()
     text = welcome_text()
@@ -3107,6 +3219,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     data = q.data or ""
+    if await _database_restore_busy_reply(update):
+        return
     try:
         allowed, limit_message = CALLBACK_LIMITER.allow(q.from_user.id, data)
         if not allowed:
@@ -3838,6 +3952,194 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not is_admin(q.from_user.id):
                 return
             await show_admin_backup_settings(q.message, q.from_user.id)
+            return
+
+        if data == "admin_restore_begin":
+            if not _is_root_admin(q.from_user.id):
+                await safe_callback_answer(
+                    q, "فقط مدیر اصلی می‌تواند دیتابیس را بازیابی کند", show_alert=True
+                )
+                return
+            await _cleanup_restore_preview(context)
+            context.user_data["awaiting"] = {"kind": "database_restore_upload"}
+            await q.message.edit_text(
+                admin_rtl_text(
+                    "♻️ <b>بازیابی بکاپ دیتابیس</b>\n\n"
+                    "فایل بکاپ با پسوند <code>.sqlite3</code> را ارسال یا فوروارد کنید.\n"
+                    "اگر فایل همراه متن یا کپشن باشد، فقط خود فایل بررسی می‌شود.\n\n"
+                    "پس از بررسی سلامت و سازگاری، پیش‌نمایش اطلاعات نمایش داده خواهد شد."
+                ),
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("❌ انصراف", callback_data="admin_restore_cancel")
+                ]]),
+            )
+            return
+
+        if data == "admin_restore_cancel" or (
+            parts[0] == "admin_restore_cancel" and len(parts) == 2
+        ):
+            if not _is_root_admin(q.from_user.id):
+                return
+            context.user_data.pop("awaiting", None)
+            await _cleanup_restore_preview(context)
+            await show_admin_backup_settings(q.message, q.from_user.id)
+            return
+
+        if parts[0] == "admin_restore_confirm" and len(parts) == 2:
+            if not _is_root_admin(q.from_user.id):
+                return
+            state = _restore_preview_from_context(context, parts[1])
+            if not state:
+                await q.message.edit_text(
+                    "⚠️ فایل یا پیش‌نمایش منقضی شده است؛ فایل را دوباره ارسال کنید.",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("♻️ ارسال دوباره", callback_data="admin_restore_begin")
+                    ]]),
+                )
+                return
+            await q.message.edit_text(
+                admin_rtl_text(
+                    "⚠️ <b>تأیید نهایی بازیابی</b>\n\n"
+                    "با تأیید این مرحله، ابتدا از دیتابیس فعلی یک بکاپ ایمنی ساخته می‌شود، "
+                    "سپس فایل انتخاب‌شده فوراً جایگزین و داخل همین اجرای ربات فعال خواهد شد.\n\n"
+                    "در زمان بازیابی، عملیات جدید کاربران برای چند لحظه متوقف می‌شود."
+                ),
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(
+                        "✅ تأیید و بازیابی فوری",
+                        callback_data=f"admin_restore_execute|{parts[1]}",
+                    )],
+                    [InlineKeyboardButton(
+                        "❌ انصراف",
+                        callback_data=f"admin_restore_cancel|{parts[1]}",
+                    )],
+                ]),
+            )
+            return
+
+        if parts[0] == "admin_restore_execute" and len(parts) == 2:
+            if not _is_root_admin(q.from_user.id):
+                return
+            state = _restore_preview_from_context(context, parts[1])
+            if not state:
+                await q.message.edit_text(
+                    "⚠️ فایل یا پیش‌نمایش منقضی شده است؛ فایل را دوباره ارسال کنید.",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("♻️ ارسال دوباره", callback_data="admin_restore_begin")
+                    ]]),
+                )
+                return
+            temp_dir = str(state.get("temp_dir") or "")
+            preview = dict(state.get("preview") or {})
+            restored = {}
+            _DATABASE_RESTORE_IN_PROGRESS.set()
+            try:
+                await q.message.edit_text(
+                    "⏳ در حال توقف امن عملیات‌ها و بازیابی دیتابیس…"
+                )
+                await _wait_for_restore_quiescence()
+                restored = await run_blocking(
+                    restore_database_backup,
+                    str(state["path"]),
+                    expected_sha256=str(preview.get("sha256") or ""),
+                    _lane="backup",
+                )
+                try:
+                    await run_blocking(
+                        _reload_runtime_after_database_restore, _lane="db"
+                    )
+                except Exception:
+                    safety_path = str(restored.get("safety_backup_path") or "")
+                    if safety_path:
+                        await run_blocking(
+                            rollback_to_safety_backup, safety_path, _lane="backup"
+                        )
+                        await run_blocking(
+                            _reload_runtime_after_database_restore, _lane="db"
+                        )
+                    raise RuntimeError("بارگذاری تنظیمات بازیابی‌شده ناموفق بود")
+
+                _clear_runtime_caches_after_restore(context.application)
+                _wake_backup_scheduler()
+                _wake_account_expiry_monitor()
+                try:
+                    await run_blocking(
+                        record_admin_audit,
+                        admin_tg_id=q.from_user.id,
+                        action="database_restore_completed",
+                        meta={
+                            "source_filename": str(state.get("filename") or "")[:255],
+                            "source_schema_version": int(preview.get("schema_version") or 0),
+                            "source_sha256_prefix": str(preview.get("sha256") or "")[:12],
+                            "users": int((preview.get("counts") or {}).get("users") or 0),
+                            "accounts": int((preview.get("counts") or {}).get("accounts") or 0),
+                            "transactions": int((preview.get("counts") or {}).get("transactions") or 0),
+                        },
+                        _lane="db",
+                    )
+                except Exception:
+                    logger.exception("database restore audit write failed")
+
+                safety_name = os.path.basename(
+                    str(restored.get("safety_backup_path") or "")
+                )
+                success_text = admin_rtl_text(
+                    "✅ <b>بازیابی دیتابیس با موفقیت انجام شد</b>\n\n"
+                    "تنظیمات، بسته‌ها و اطلاعات کاربران همین حالا بارگذاری و فعال شدند؛ "
+                    "نیازی به ری‌استارت ربات یا سرور نیست.\n"
+                    f"بکاپ ایمنی دیتابیس قبلی: <code>{html.escape(safety_name or 'ایجاد نشد')}</code>"
+                )
+                success_markup = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙 بکاپ و بازیابی", callback_data="admin_backup_settings")
+                ]])
+                try:
+                    await q.message.edit_text(
+                        success_text, parse_mode="HTML", reply_markup=success_markup
+                    )
+                except Exception:
+                    logger.exception("database restore succeeded but result edit failed")
+                    try:
+                        await q.message.reply_text(
+                            success_text, parse_mode="HTML", reply_markup=success_markup
+                        )
+                    except Exception:
+                        logger.exception("database restore success fallback message failed")
+            except RestoreValidationError as exc:
+                await q.message.edit_text(
+                    admin_rtl_text(f"❌ بازیابی انجام نشد.\n\n{html.escape(str(exc))}"),
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("♻️ ارسال دوباره", callback_data="admin_restore_begin")
+                    ]]),
+                )
+            except Exception as exc:
+                logger.exception("immediate database restore failed: %s", type(exc).__name__)
+                detail = (
+                    str(exc)
+                    if isinstance(exc, RuntimeError) and len(str(exc)) <= 160
+                    else "دیتابیس فعلی بدون تغییر نگه داشته شد یا از بکاپ ایمنی برگشت داده شد"
+                )
+                await q.message.edit_text(
+                    admin_rtl_text(
+                        f"❌ بازیابی دیتابیس کامل نشد.\n\n{html.escape(detail)}"
+                    ),
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("🔙 بکاپ و بازیابی", callback_data="admin_backup_settings")
+                    ]]),
+                )
+            finally:
+                context.user_data.pop("awaiting", None)
+                context.user_data.pop("database_restore_preview", None)
+                try:
+                    if temp_dir:
+                        await run_blocking(shutil.rmtree, temp_dir, True, _lane="backup")
+                except Exception:
+                    logger.warning("restore upload cleanup failed", exc_info=True)
+                finally:
+                    _DATABASE_RESTORE_IN_PROGRESS.clear()
             return
 
         if parts[0] == "admin_auto_backup_set" and len(parts) == 2:
@@ -5270,6 +5572,8 @@ async def _submit_card_receipt_and_notify(
 
 
 async def card_receipt_media_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await _database_restore_busy_reply(update):
+        return
     schedule_telegram_profile(context, update.effective_user)
     awaiting = dict(context.user_data.get("awaiting") or {})
     request = {}
@@ -5298,7 +5602,107 @@ async def card_receipt_media_router(update: Update, context: ContextTypes.DEFAUL
     )
 
 
+async def database_restore_document_router(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    """Accept only the document while deliberately ignoring forwarded captions."""
+    if await _database_restore_busy_reply(update):
+        return
+    if not _is_root_admin(update.effective_user.id):
+        return
+    awaiting = dict(context.user_data.get("awaiting") or {})
+    if awaiting.get("kind") != "database_restore_upload":
+        return
+    document = getattr(update.effective_message, "document", None)
+    if document is None:
+        return
+    filename = os.path.basename(str(getattr(document, "file_name", "") or ""))
+    if not filename.lower().endswith(".sqlite3"):
+        await update.effective_message.reply_text(
+            "❌ فقط فایل بکاپ با پسوند .sqlite3 قابل قبول است."
+        )
+        return
+    declared_size = int(getattr(document, "file_size", 0) or 0)
+    if declared_size > MAX_RESTORE_FILE_BYTES:
+        await update.effective_message.reply_text(
+            f"❌ حجم فایل بیشتر از حد مجاز {human_bytes(MAX_RESTORE_FILE_BYTES)} است."
+        )
+        return
+
+    await _cleanup_restore_preview(context)
+    temp_dir = tempfile.mkdtemp(prefix="account-sales-bot-restore-")
+    candidate_path = os.path.join(temp_dir, "uploaded-backup.sqlite3")
+    try:
+        if declared_size:
+            free_bytes = int(shutil.disk_usage(temp_dir).free)
+            if free_bytes < declared_size * 2 + 16 * 1024 * 1024:
+                raise RestoreValidationError("فضای خالی سرور برای بررسی امن این بکاپ کافی نیست")
+        telegram_file = await context.bot.get_file(document.file_id)
+        await telegram_file.download_to_drive(custom_path=candidate_path)
+        preview = await run_blocking(
+            inspect_database_backup, candidate_path, _lane="backup"
+        )
+    except RestoreValidationError as exc:
+        await run_blocking(shutil.rmtree, temp_dir, True, _lane="backup")
+        await update.effective_message.reply_text(
+            admin_rtl_text(f"❌ فایل قابل بازیابی نیست.\n\n{html.escape(str(exc))}"),
+            parse_mode="HTML",
+        )
+        return
+    except Exception as exc:
+        await run_blocking(shutil.rmtree, temp_dir, True, _lane="backup")
+        logger.exception("database restore upload/inspection failed: %s", type(exc).__name__)
+        await update.effective_message.reply_text(
+            "❌ دریافت یا بررسی فایل ناموفق بود؛ دوباره تلاش کنید."
+        )
+        return
+
+    token = secrets.token_hex(6)
+    context.user_data.pop("awaiting", None)
+    context.user_data["database_restore_preview"] = {
+        "token": token,
+        "temp_dir": temp_dir,
+        "path": candidate_path,
+        "filename": filename,
+        "preview": preview,
+        "uploaded_monotonic": time.monotonic(),
+    }
+    counts = dict(preview.get("counts") or {})
+    created_at = str(preview.get("backup_created_at") or "")
+    created_text = (
+        _format_backup_time(created_at)
+        if created_at
+        else "در بکاپ‌های قدیمی ثبت نشده"
+    )
+    app_version = str(preview.get("backup_app_version") or "نامشخص")
+    await update.effective_message.reply_text(
+        admin_rtl_text(
+            "🔎 <b>پیش‌نمایش بکاپ</b>\n\n"
+            f"فایل: <code>{html.escape(filename)}</code>\n"
+            f"زمان ایجاد: <b>{html.escape(created_text)}</b>\n"
+            f"نسخه ربات بکاپ: <b>{html.escape(app_version)}</b>\n"
+            f"نسخه دیتابیس: <b>{int(preview.get('schema_version') or 0)}</b>\n"
+            f"حجم فایل: <b>{human_bytes(int(preview.get('size_bytes') or 0))}</b>\n\n"
+            f"کاربران: <b>{int(counts.get('users') or 0):,}</b>\n"
+            f"اکانت‌ها: <b>{int(counts.get('accounts') or 0):,}</b>\n"
+            f"تراکنش‌ها: <b>{int(counts.get('transactions') or 0):,}</b>\n\n"
+            "سلامت SQLite: <b>تأیید شد ✅</b>"
+        ),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                "♻️ ادامه بازیابی", callback_data=f"admin_restore_confirm|{token}"
+            )],
+            [InlineKeyboardButton(
+                "❌ انصراف", callback_data=f"admin_restore_cancel|{token}"
+            )],
+        ]),
+    )
+
+
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await _database_restore_busy_reply(update):
+        return
     schedule_telegram_profile(context, update.effective_user)
     value = (update.message.text or "").strip()
     awaiting = dict(context.user_data.get("awaiting") or {})
@@ -7574,6 +7978,8 @@ async def cancel_latest_payment(q, context):
     )
 
 async def verify_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await _database_restore_busy_reply(update):
+        return
     if not context.args:
         await update.message.reply_text("/verify AUTHORITY")
         return
@@ -7684,6 +8090,8 @@ async def create_test(q, context, service: str):
 
 
 async def contact_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await _database_restore_busy_reply(update):
+        return
     schedule_telegram_profile(context, update.effective_user)
     contact = update.message.contact if update.message else None
     if not contact:
@@ -7695,6 +8103,8 @@ async def contact_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await _database_restore_busy_reply(update):
+        return
     if not is_admin(update.effective_user.id):
         return
     snap, db = await live_health_snapshot()
@@ -7725,8 +8135,12 @@ async def _health_probe_loop():
     # panel must never make the watchdog think the Telegram event loop is dead.
     await asyncio.sleep(3)
     while True:
+        if _DATABASE_RESTORE_IN_PROGRESS.is_set():
+            await asyncio.sleep(1)
+            continue
         try:
-            await live_health_snapshot()
+            async with _background_data_activity():
+                await live_health_snapshot()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -7786,6 +8200,8 @@ def _account_expiry_notification_message(
 
 
 async def _scan_one_account_for_expiry(application, account: dict) -> str:
+    if _DATABASE_RESTORE_IN_PROGRESS.is_set():
+        return "restore_paused"
     if not bool(APP_SETTINGS.get("account_expiry_notifications_enabled", True)):
         return "disabled"
     account_id = int(account.get("account_id") or 0)
@@ -7866,6 +8282,8 @@ async def _scan_one_account_for_expiry(application, account: dict) -> str:
 async def _scan_account_service(application, accounts: list[dict]):
     counts = {}
     for account in accounts:
+        if _DATABASE_RESTORE_IN_PROGRESS.is_set():
+            break
         if not bool(APP_SETTINGS.get("account_expiry_notifications_enabled", True)):
             break
         result = await _scan_one_account_for_expiry(application, account)
@@ -7877,6 +8295,8 @@ async def _scan_account_service(application, accounts: list[dict]):
 
 
 async def _run_account_expiry_scan(application) -> dict:
+    if _DATABASE_RESTORE_IN_PROGRESS.is_set():
+        return {"accounts": 0, "openvpn": {"restore_paused": 1}, "v2ray": {}}
     accounts = await run_blocking(list_accounts_for_expiry_monitor, _lane="db")
     by_service = {
         service: [row for row in accounts if row.get("service") == service]
@@ -7893,6 +8313,9 @@ async def _run_account_expiry_scan(application) -> dict:
 
 async def _account_expiry_monitor_loop(application, wake: asyncio.Event):
     while True:
+        if _DATABASE_RESTORE_IN_PROGRESS.is_set():
+            await asyncio.sleep(1)
+            continue
         try:
             enabled = bool(APP_SETTINGS.get("account_expiry_notifications_enabled", True))
             interval = int(APP_SETTINGS.get("account_expiry_check_interval_minutes", 30) or 30)
@@ -7903,8 +8326,12 @@ async def _account_expiry_monitor_loop(application, wake: asyncio.Event):
                 continue
             except asyncio.TimeoutError:
                 pass
-            if bool(APP_SETTINGS.get("account_expiry_notifications_enabled", True)):
-                await _run_account_expiry_scan(application)
+            if (
+                not _DATABASE_RESTORE_IN_PROGRESS.is_set()
+                and bool(APP_SETTINGS.get("account_expiry_notifications_enabled", True))
+            ):
+                async with _background_data_activity():
+                    await _run_account_expiry_scan(application)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -8004,6 +8431,9 @@ async def _backup_loop(application, wake: asyncio.Event):
     # The lightweight scheduler is interruptible so toggle/hour changes become
     # active immediately without restarting the process.
     while True:
+        if _DATABASE_RESTORE_IN_PROGRESS.is_set():
+            await asyncio.sleep(1)
+            continue
         try:
             status = await run_blocking(auto_backup_status, _lane="db")
             enabled = bool(status.get("enabled"))
@@ -8015,16 +8445,19 @@ async def _backup_loop(application, wake: asyncio.Event):
                 continue
             except asyncio.TimeoutError:
                 pass
-            fresh = await run_blocking(auto_backup_status, _lane="db")
-            if not bool(fresh.get("enabled")):
-                logger.info("scheduled SQLite backup skipped: disabled by admin")
+            if _DATABASE_RESTORE_IN_PROGRESS.is_set():
                 continue
-            result = await run_blocking(
-                backup_database, force=True, keep=BACKUP_KEEP, _lane="backup"
-            )
-            if result.get("created"):
-                logger.info("scheduled SQLite backup created: %s", result.get("path"))
-                await _send_scheduled_backup(application, result)
+            async with _background_data_activity():
+                fresh = await run_blocking(auto_backup_status, _lane="db")
+                if not bool(fresh.get("enabled")):
+                    logger.info("scheduled SQLite backup skipped: disabled by admin")
+                    continue
+                result = await run_blocking(
+                    backup_database, force=True, keep=BACKUP_KEEP, _lane="backup"
+                )
+                if result.get("created"):
+                    logger.info("scheduled SQLite backup created: %s", result.get("path"))
+                    await _send_scheduled_backup(application, result)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -8061,9 +8494,9 @@ async def post_init(application):
         )
     application.bot_data["background_tasks"] = tasks
     logger.info(
-        "Account Sales Bot v1.1.0 runtime initialized watchdog=%s sqlite=%s cache_ttl=%.1fs workers=%d queue_cap=%d "
+        "Account Sales Bot v%s runtime initialized watchdog=%s sqlite=%s cache_ttl=%.1fs workers=%d queue_cap=%d "
         "lanes=misc:%d,db:%d,mikrotik:%d,xui:%d,zarinpal:%d read_deadline=%.1fs",
-        WATCHDOG_ENABLED, (await run_blocking(database_stats)).get("quick_check"), STATUS_CACHE_TTL_SECONDS,
+        APP_VERSION, WATCHDOG_ENABLED, (await run_blocking(database_stats)).get("quick_check"), STATUS_CACHE_TTL_SECONDS,
         BOT_CONCURRENT_UPDATES, BOT_UPDATE_QUEUE_CAP,
         BOT_IO_WORKERS, BOT_DB_WORKERS, BOT_MIKROTIK_WORKERS, BOT_XUI_WORKERS, BOT_ZARINPAL_WORKERS,
         SERVICE_READ_TOTAL_TIMEOUT_SECONDS,
@@ -8117,9 +8550,10 @@ def main():
     app.add_handler(CallbackQueryHandler(callback_router))
     app.add_handler(MessageHandler(filters.CONTACT, contact_router))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, card_receipt_media_router))
+    app.add_handler(MessageHandler(filters.Document.ALL, database_restore_document_router))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
     app.add_error_handler(error_handler)
-    logger.info("Account Sales Bot v1.1.0 started")
+    logger.info("Account Sales Bot v%s started", APP_VERSION)
     app.run_polling(
         allowed_updates=[Update.MESSAGE, Update.CALLBACK_QUERY],
         bootstrap_retries=-1,

@@ -4,6 +4,19 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+def _application_version() -> str:
+    try:
+        version_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "VERSION")
+        with open(version_file, "r", encoding="utf-8") as handle:
+            value = handle.read().strip()
+        return value or "0.0.0"
+    except OSError:
+        return "0.0.0"
+
+
+APP_VERSION = _application_version()
+
+
 def _env_int(name: str, default: int, minimum=None, maximum=None) -> int:
     try:
         value = int(os.getenv(name, str(default)).strip())

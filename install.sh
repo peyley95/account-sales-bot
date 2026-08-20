@@ -182,6 +182,7 @@ install_python_runtime() {
     "$INSTALL_DIR/storage.py" \
     "$INSTALL_DIR/runtime.py" \
     "$INSTALL_DIR/app_settings.py" \
+    "$INSTALL_DIR/restore_manager.py" \
     "$INSTALL_DIR/account_notifications.py" \
     "$INSTALL_DIR/services/mikrotik.py" \
     "$INSTALL_DIR/services/xui.py" \

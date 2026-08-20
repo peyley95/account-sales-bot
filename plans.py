@@ -258,6 +258,20 @@ def refresh_test_plan(row: dict | None = None):
 
 refresh_test_plan()
 
+
+def reload_plan_registries():
+    """Re-run idempotent migrations and atomically reload plans after restore."""
+    initialize_sale_plans(_legacy_env_seed())
+    initialize_service_sale_plans()
+    initialize_trial_plan({**_trial_seed, "enabled": True})
+    refresh_plans()
+    refresh_test_plan()
+    return {
+        "openvpn": len(OPENVPN_PLANS),
+        "v2ray": len(V2RAY_PLANS),
+        "trial_enabled": test_plan_enabled(),
+    }
+
 def test_plan_enabled() -> bool:
     return bool(TEST_PLAN.get("enabled", True))
 

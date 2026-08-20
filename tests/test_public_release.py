@@ -56,7 +56,7 @@ class PublicReleaseTests(unittest.TestCase):
     def test_public_support_files_exist(self):
         required = (
             "README.md", "LICENSE", ".env.example", "install.sh", "update.sh",
-            ".github/workflows/ci.yml",
+            ".github/workflows/ci.yml", "restore_manager.py",
         )
         for relative in required:
             self.assertTrue((ROOT / relative).is_file(), relative)
@@ -92,7 +92,7 @@ class PublicReleaseTests(unittest.TestCase):
         self.assertEqual(lines, {"BOT_TOKEN", "ADMIN_IDS", "DATA_DIR"})
 
     def test_version_is_current_public_release(self):
-        self.assertEqual((ROOT / "VERSION").read_text(encoding="utf-8").strip(), "1.1.0")
+        self.assertEqual((ROOT / "VERSION").read_text(encoding="utf-8").strip(), "1.2.0")
 
 
 if __name__ == "__main__":

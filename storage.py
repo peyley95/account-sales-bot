@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from config import DATA_DIR, REFERRAL_CODE_PREFIX, AUTO_BACKUP_ENABLED
+from config import APP_VERSION, DATA_DIR, REFERRAL_CODE_PREFIX, AUTO_BACKUP_ENABLED
 
 os.makedirs(DATA_DIR, exist_ok=True)
 DB_FILE = os.path.join(DATA_DIR, "vpn_bot_v2.sqlite3")
@@ -19,6 +19,7 @@ WALLET_ADMIN_AUDIT_FILE = os.path.join(DATA_DIR, "wallet_admin_audit.json")
 BACKUP_DIR = os.path.join(DATA_DIR, "backups")
 _INIT_LOCK = threading.RLock()
 _BACKUP_LOCK = threading.Lock()
+SCHEMA_VERSION = 27
 _REFERRAL_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 MAX_WALLET_BALANCE_TOMAN = 9_000_000_000_000_000
 MAX_RESELLER_DEBT_TOMAN = 9_000_000_000_000_000
@@ -369,7 +370,10 @@ def _schema(conn: sqlite3.Connection):
             "ALTER TABLE resellers ADD COLUMN trial_enabled INTEGER NOT NULL DEFAULT 1 "
             "CHECK(trial_enabled IN (0,1))"
         )
-    conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version','27')")
+    conn.execute(
+        "INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version',?)",
+        (str(SCHEMA_VERSION),),
+    )
 
 
 def _read_json_file(path: str) -> dict:
@@ -3585,6 +3589,24 @@ def auto_backup_status() -> dict:
 # -------------------- Backup / health --------------------
 
 
+def _annotate_database_backup(
+    conn: sqlite3.Connection, *, created_at: str, backup_kind: str
+):
+    """Store portable preview metadata inside a completed backup copy."""
+    values = {
+        "backup_created_at": str(created_at),
+        "backup_app_version": str(APP_VERSION),
+        "backup_schema_version": str(SCHEMA_VERSION),
+        "backup_kind": str(backup_kind),
+    }
+    for key, value in values.items():
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)",
+            (key, value),
+        )
+    conn.commit()
+
+
 def export_database_snapshot() -> dict:
     """Create a consistent temporary SQLite snapshot for Telegram delivery.
 
@@ -3597,6 +3619,7 @@ def export_database_snapshot() -> dict:
     temp_dir = tempfile.mkdtemp(prefix="vpn-bot-db-export-")
     filename = os.path.basename(DB_FILE)
     path = os.path.join(temp_dir, filename)
+    created_at = now_iso()
     try:
         with _BACKUP_LOCK:
             src = None
@@ -3605,7 +3628,9 @@ def export_database_snapshot() -> dict:
                 src = _connect()
                 dst = sqlite3.connect(path)
                 src.backup(dst)
-                dst.commit()
+                _annotate_database_backup(
+                    dst, created_at=created_at, backup_kind="manual_export"
+                )
             finally:
                 if dst is not None:
                     dst.close()
@@ -3619,7 +3644,7 @@ def export_database_snapshot() -> dict:
         "temp_dir": temp_dir,
         "filename": filename,
         "size_bytes": os.path.getsize(path),
-        "created_at": now_iso(),
+        "created_at": created_at,
     }
 
 def _backup_database_unlocked(*, force: bool = False, keep: int = 14) -> dict:
@@ -3637,10 +3662,14 @@ def _backup_database_unlocked(*, force: bool = False, keep: int = 14) -> dict:
             pass
     stamp = now.strftime("%Y%m%d-%H%M%S-%f")
     path = os.path.join(BACKUP_DIR, f"vpn-bot-{stamp}.sqlite3")
+    created_at = now_iso()
     src = _connect()
     dst = sqlite3.connect(path)
     try:
         src.backup(dst)
+        _annotate_database_backup(
+            dst, created_at=created_at, backup_kind="automatic"
+        )
     finally:
         dst.close()
         src.close()
@@ -3650,7 +3679,7 @@ def _backup_database_unlocked(*, force: bool = False, keep: int = 14) -> dict:
             old.unlink()
         except Exception:
             pass
-    result = {"path": path, "created_at": now_iso(), "size_bytes": os.path.getsize(path), "created": True}
+    result = {"path": path, "created_at": created_at, "size_bytes": os.path.getsize(path), "created": True}
     set_setting("last_backup", result)
     return result
 
