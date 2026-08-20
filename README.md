@@ -54,7 +54,6 @@ sudo bash /opt/account-sales-bot/update.sh
 </div>
 
 
-این پروژه با مجوز [MIT](LICENSE) منتشر می‌شود.
 
 ## توقف و اجرای مجدد ربات
 
