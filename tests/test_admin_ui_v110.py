@@ -68,7 +68,7 @@ class AdminUiV110Tests(unittest.IsolatedAsyncioTestCase):
         ])
         self.assertTrue(all(len(value.encode("utf-8")) <= 64 for value in values))
 
-    async def test_settings_contains_only_five_logical_groups(self):
+    async def test_settings_contains_groups_and_public_broadcast(self):
         message = FakeMessage()
         with patch.object(bot, "is_admin", return_value=True):
             await bot.show_admin_settings_menu(message, 911000)
@@ -79,6 +79,7 @@ class AdminUiV110Tests(unittest.IsolatedAsyncioTestCase):
             "admin_gateways",
             "admin_marketing_menu",
             "admin_notification_settings",
+            "admin_broadcast_begin",
             "admin_tools",
         ])
         self.assertNotIn("admin_backup_settings", values)

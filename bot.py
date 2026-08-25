@@ -19,7 +19,7 @@ from zoneinfo import ZoneInfo
 from urllib.parse import unquote, urlsplit
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, CopyTextButton, InputFile
-from telegram.error import BadRequest
+from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError
 from telegram.ext import ApplicationBuilder, BaseUpdateProcessor, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from config import (
@@ -65,6 +65,7 @@ from storage import (
     credit_referral_reward, wallet_order_debited,
     update_user_profile, get_user_profile, record_transaction, list_transactions,
     list_known_users, search_known_users, admin_adjust_wallet,
+    mark_user_started, list_broadcast_recipient_ids, broadcast_recipient_count,
     get_user_admin_summary, list_user_transactions,
     record_admin_audit, list_admin_audit, maintenance_mode, set_maintenance_mode,
     auto_backup_enabled, set_auto_backup_enabled, auto_backup_status,
@@ -110,6 +111,8 @@ _BACKUP_SCHEDULER_WAKE = None
 _DATABASE_RESTORE_IN_PROGRESS = threading.Event()
 _DATABASE_RESTORE_QUIESCE_SECONDS = 60.0
 _BACKGROUND_DATA_ACTIVITY = 0
+_BROADCAST_DRAFT_TTL_SECONDS = 15 * 60
+_BROADCAST_SEND_INTERVAL_SECONDS = 0.07
 _RLM = "\u200f"
 
 
@@ -1593,6 +1596,7 @@ def admin_settings_menu_keyboard(
         [InlineKeyboardButton("💳 درگاه‌های پرداخت", callback_data="admin_gateways")],
         [InlineKeyboardButton("🎁 بازاریابی و کیف پول", callback_data="admin_marketing_menu")],
         [InlineKeyboardButton("🔔 اعلان‌ها", callback_data="admin_notification_settings")],
+        [InlineKeyboardButton("📢 ارسال پیام عمومی در ربات", callback_data="admin_broadcast_begin")],
         [InlineKeyboardButton("🔙 بازگشت", callback_data="admin_tools")],
     ])
 
@@ -2223,6 +2227,153 @@ async def _database_restore_busy_reply(update: Update) -> bool:
         if message is not None:
             await message.reply_text(text)
     return True
+
+
+def _active_public_broadcast(application):
+    task = getattr(application, "bot_data", {}).get("public_broadcast_task")
+    return task if task is not None and not task.done() else None
+
+
+def _public_broadcast_draft(context, token: str = "") -> dict:
+    draft = dict(context.user_data.get("public_broadcast_draft") or {})
+    if token and str(draft.get("token") or "") != str(token):
+        return {}
+    created = float(draft.get("created_monotonic") or 0)
+    if created <= 0 or time.monotonic() - created > _BROADCAST_DRAFT_TTL_SECONDS:
+        return {}
+    if int(draft.get("source_chat_id") or 0) == 0:
+        return {}
+    if int(draft.get("source_message_id") or 0) <= 0:
+        return {}
+    return draft
+
+
+def _retry_after_seconds(exc: RetryAfter) -> float:
+    value = getattr(exc, "retry_after", 1)
+    if hasattr(value, "total_seconds"):
+        value = value.total_seconds()
+    try:
+        return min(max(float(value), 1.0), 60.0)
+    except (TypeError, ValueError):
+        return 1.0
+
+
+async def _copy_public_broadcast_message(
+    bot_client, *, target_tg_id: int, source_chat_id: int, source_message_id: int
+) -> tuple[bool, str]:
+    for attempt in range(2):
+        try:
+            await bot_client.copy_message(
+                chat_id=int(target_tg_id),
+                from_chat_id=int(source_chat_id),
+                message_id=int(source_message_id),
+            )
+            return True, ""
+        except Forbidden:
+            return False, "forbidden"
+        except RetryAfter as exc:
+            if attempt:
+                return False, "rate_limit"
+            await asyncio.sleep(_retry_after_seconds(exc))
+        except TelegramError as exc:
+            if attempt:
+                logger.warning(
+                    "broadcast Telegram failure tg_id=%s error=%s",
+                    target_tg_id, type(exc).__name__,
+                )
+                return False, "telegram_error"
+            await asyncio.sleep(1)
+        except Exception as exc:
+            logger.warning(
+                "broadcast unexpected failure tg_id=%s error=%s",
+                target_tg_id, type(exc).__name__,
+            )
+            return False, "unexpected_error"
+    return False, "unknown"
+
+
+async def _run_public_broadcast(
+    application, *, admin_tg_id: int, source_chat_id: int,
+    source_message_id: int, text_length: int, text_sha256: str,
+):
+    sent = 0
+    failed = 0
+    failures = {}
+    recipients = []
+    try:
+        recipients = await run_blocking(
+            list_broadcast_recipient_ids,
+            exclude_tg_ids=(int(admin_tg_id),),
+            _lane="db",
+        )
+        for target_tg_id in recipients:
+            ok, reason = await _copy_public_broadcast_message(
+                application.bot,
+                target_tg_id=int(target_tg_id),
+                source_chat_id=int(source_chat_id),
+                source_message_id=int(source_message_id),
+            )
+            if ok:
+                sent += 1
+            else:
+                failed += 1
+                failures[reason] = int(failures.get(reason, 0)) + 1
+            await asyncio.sleep(_BROADCAST_SEND_INTERVAL_SECONDS)
+
+        try:
+            await run_blocking(
+                record_admin_audit,
+                admin_tg_id=int(admin_tg_id),
+                action="public_broadcast_completed",
+                meta={
+                    "recipients": len(recipients),
+                    "sent": sent,
+                    "failed": failed,
+                    "failure_types": failures,
+                    "text_length": int(text_length),
+                    "text_sha256_prefix": str(text_sha256 or "")[:12],
+                },
+                _lane="db",
+            )
+        except Exception:
+            logger.exception("public broadcast audit write failed")
+
+        await application.bot.send_message(
+            chat_id=int(admin_tg_id),
+            text=admin_rtl_text(
+                "📢 <b>ارسال پیام عمومی تمام شد</b>\n\n"
+                f"مخاطبان: <b>{len(recipients):,}</b>\n"
+                f"ارسال موفق: <b>{sent:,} ✅</b>\n"
+                f"ارسال ناموفق: <b>{failed:,} ❌</b>"
+            ),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 تنظیمات", callback_data="admin_settings_menu")
+            ]]),
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.exception("public broadcast stopped unexpectedly: %s", type(exc).__name__)
+        try:
+            await application.bot.send_message(
+                chat_id=int(admin_tg_id),
+                text=(
+                    "❌ ارسال پیام عمومی کامل نشد.\n\n"
+                    f"ارسال موفق پیش از خطا: {sent:,}\n"
+                    f"ارسال ناموفق: {failed:,}"
+                ),
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙 تنظیمات", callback_data="admin_settings_menu")
+                ]]),
+            )
+        except Exception:
+            logger.exception("public broadcast failure notification failed")
+    finally:
+        current = asyncio.current_task()
+        bot_data = getattr(application, "bot_data", {})
+        if bot_data.get("public_broadcast_task") is current:
+            bot_data.pop("public_broadcast_task", None)
 
 
 async def show_admin_backup_settings(message, admin_tg_id: int):
@@ -3205,6 +3356,7 @@ async def show_reseller_debt(message, tg_id: int):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await _database_restore_busy_reply(update):
         return
+    await run_blocking(mark_user_started, update.effective_user.id, _lane="db")
     schedule_telegram_profile(context, update.effective_user)
     context.user_data.clear()
     text = welcome_text()
@@ -3389,6 +3541,100 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             context.user_data.clear()
             await show_admin_settings_menu(q.message, q.from_user.id)
+            return
+
+        if data == "admin_broadcast_begin":
+            if not is_admin(q.from_user.id):
+                return
+            if _active_public_broadcast(context.application):
+                await safe_callback_answer(
+                    q, "یک پیام عمومی در حال ارسال است", show_alert=True
+                )
+                return
+            context.user_data.clear()
+            context.user_data["awaiting"] = {"kind": "admin_broadcast_message"}
+            await q.message.edit_text(
+                admin_rtl_text(
+                    "📢 <b>ارسال پیام عمومی در ربات</b>\n\n"
+                    "متن دلخواه را در یک پیام ارسال کنید. همان پیام با قالب‌بندی فعلی، "
+                    "بدون برچسب Forward و بدون تغییر برای کاربران ارسال می‌شود.\n\n"
+                    "پیش از شروع ارسال، تعداد مخاطبان و مرحله تأیید نهایی نمایش داده خواهد شد."
+                ),
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("❌ انصراف", callback_data="admin_broadcast_cancel")
+                ]]),
+            )
+            return
+
+        if data == "admin_broadcast_cancel" or (
+            parts[0] == "admin_broadcast_cancel" and len(parts) == 2
+        ):
+            if not is_admin(q.from_user.id):
+                return
+            context.user_data.pop("awaiting", None)
+            context.user_data.pop("public_broadcast_draft", None)
+            await show_admin_settings_menu(q.message, q.from_user.id)
+            return
+
+        if parts[0] == "admin_broadcast_confirm" and len(parts) == 2:
+            if not is_admin(q.from_user.id):
+                return
+            if _active_public_broadcast(context.application):
+                await safe_callback_answer(
+                    q, "یک پیام عمومی در حال ارسال است", show_alert=True
+                )
+                return
+            draft = _public_broadcast_draft(context, parts[1])
+            if not draft:
+                context.user_data.pop("public_broadcast_draft", None)
+                await q.message.edit_text(
+                    "⚠️ پیش‌نمایش پیام منقضی شده است؛ پیام را دوباره ارسال کنید.",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("📢 ارسال دوباره", callback_data="admin_broadcast_begin")
+                    ]]),
+                )
+                return
+            recipient_count = int(draft.get("recipient_count") or 0)
+            if recipient_count <= 0:
+                context.user_data.pop("public_broadcast_draft", None)
+                await q.message.edit_text(
+                    "⚠️ هیچ کاربری برای دریافت پیام عمومی ثبت نشده است.",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("🔙 تنظیمات", callback_data="admin_settings_menu")
+                    ]]),
+                )
+                return
+            context.user_data.pop("public_broadcast_draft", None)
+            coroutine = _run_public_broadcast(
+                context.application,
+                admin_tg_id=q.from_user.id,
+                source_chat_id=int(draft["source_chat_id"]),
+                source_message_id=int(draft["source_message_id"]),
+                text_length=int(draft.get("text_length") or 0),
+                text_sha256=str(draft.get("text_sha256") or ""),
+            )
+            try:
+                task = context.application.create_task(
+                    coroutine,
+                    name=f"public-broadcast-{q.from_user.id}-{parts[1]}",
+                )
+            except Exception:
+                coroutine.close()
+                raise
+            context.application.bot_data["public_broadcast_task"] = task
+            await q.message.edit_text(
+                admin_rtl_text(
+                    "⏳ <b>ارسال پیام عمومی شروع شد</b>\n\n"
+                    f"تعداد مخاطبان: <b>{recipient_count:,}</b>\n"
+                    "ارسال در پس‌زمینه و با سرعت کنترل‌شده انجام می‌شود؛ "
+                    "پس از پایان، گزارش نتیجه برای شما ارسال خواهد شد."
+                ),
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙 پنل مدیریت", callback_data="admin_tools")
+                ]]),
+            )
             return
 
         if data == "admin_connections_menu":
@@ -5729,6 +5975,81 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
                 "🧾 رسیدهای کارت به کارت", callback_data="admin_card_requests|0"
             )]]),
+        )
+        return
+
+    if awaiting.get("kind") == "admin_broadcast_message":
+        if not is_admin(update.effective_user.id):
+            context.user_data.pop("awaiting", None)
+            return
+        if _active_public_broadcast(context.application):
+            context.user_data.pop("awaiting", None)
+            await update.message.reply_text(
+                "⚠️ یک پیام عمومی دیگر در حال ارسال است. پس از پایان دوباره تلاش کنید.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙 تنظیمات", callback_data="admin_settings_menu")
+                ]]),
+            )
+            return
+        original_text = str(update.message.text or "")
+        if not original_text.strip():
+            context.user_data["awaiting"] = awaiting
+            await update.message.reply_text("❌ متن پیام نمی‌تواند خالی باشد.")
+            return
+        recipient_count = await run_blocking(
+            broadcast_recipient_count,
+            exclude_tg_ids=(int(update.effective_user.id),),
+            _lane="db",
+        )
+        if recipient_count <= 0:
+            context.user_data.pop("awaiting", None)
+            await update.message.reply_text(
+                "⚠️ هنوز هیچ کاربری برای دریافت پیام عمومی ثبت نشده است.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔙 تنظیمات", callback_data="admin_settings_menu")
+                ]]),
+            )
+            return
+        source_chat_id = int(
+            getattr(getattr(update, "effective_chat", None), "id", 0)
+            or getattr(update.message, "chat_id", 0)
+            or update.effective_user.id
+        )
+        source_message_id = int(getattr(update.message, "message_id", 0) or 0)
+        if source_message_id <= 0:
+            context.user_data["awaiting"] = awaiting
+            await update.message.reply_text(
+                "❌ شناسه پیام قابل تشخیص نبود؛ پیام را دوباره ارسال کنید."
+            )
+            return
+        token = secrets.token_hex(6)
+        context.user_data.pop("awaiting", None)
+        context.user_data["public_broadcast_draft"] = {
+            "token": token,
+            "source_chat_id": source_chat_id,
+            "source_message_id": source_message_id,
+            "recipient_count": int(recipient_count),
+            "text_length": len(original_text),
+            "text_sha256": hashlib.sha256(original_text.encode("utf-8")).hexdigest(),
+            "created_monotonic": time.monotonic(),
+        }
+        await update.message.reply_text(
+            admin_rtl_text(
+                "⚠️ <b>تأیید ارسال پیام عمومی</b>\n\n"
+                "پیام بالا عیناً و بدون تغییر ارسال می‌شود.\n"
+                f"تعداد مخاطبان: <b>{int(recipient_count):,}</b>\n"
+                f"تعداد نویسه‌های متن: <b>{len(original_text):,}</b>\n\n"
+                "آیا ارسال شروع شود؟"
+            ),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    "✅ شروع ارسال", callback_data=f"admin_broadcast_confirm|{token}"
+                )],
+                [InlineKeyboardButton(
+                    "❌ انصراف", callback_data=f"admin_broadcast_cancel|{token}"
+                )],
+            ]),
         )
         return
 

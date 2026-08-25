@@ -19,7 +19,7 @@ WALLET_ADMIN_AUDIT_FILE = os.path.join(DATA_DIR, "wallet_admin_audit.json")
 BACKUP_DIR = os.path.join(DATA_DIR, "backups")
 _INIT_LOCK = threading.RLock()
 _BACKUP_LOCK = threading.Lock()
-SCHEMA_VERSION = 27
+SCHEMA_VERSION = 28
 _REFERRAL_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 MAX_WALLET_BALANCE_TOMAN = 9_000_000_000_000_000
 MAX_RESELLER_DEBT_TOMAN = 9_000_000_000_000_000
@@ -93,6 +93,7 @@ def _schema(conn: sqlite3.Connection):
             language_code TEXT NOT NULL DEFAULT '',
             phone_number TEXT NOT NULL DEFAULT '',
             email TEXT NOT NULL DEFAULT '',
+            bot_started_at TEXT NOT NULL DEFAULT '',
             test_openvpn INTEGER NOT NULL DEFAULT 0,
             test_v2ray INTEGER NOT NULL DEFAULT 0,
             legacy_purchase_qualified INTEGER NOT NULL DEFAULT 0,
@@ -370,6 +371,25 @@ def _schema(conn: sqlite3.Connection):
             "ALTER TABLE resellers ADD COLUMN trial_enabled INTEGER NOT NULL DEFAULT 1 "
             "CHECK(trial_enabled IN (0,1))"
         )
+    # v1.3 records explicit /start recipients. Existing installations cannot
+    # distinguish historical starters from other known bot users, so the
+    # one-time additive migration preserves expected broadcast reach by marking
+    # every existing user with their original creation time. Users created by
+    # admin-only operations after this migration remain excluded until /start.
+    user_columns = {
+        str(row[1]) for row in conn.execute("PRAGMA table_info(users)")
+    }
+    if "bot_started_at" not in user_columns:
+        conn.execute(
+            "ALTER TABLE users ADD COLUMN bot_started_at TEXT NOT NULL DEFAULT ''"
+        )
+        conn.execute(
+            "UPDATE users SET bot_started_at=created_at WHERE bot_started_at=''"
+        )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_users_bot_started "
+        "ON users(bot_started_at,tg_id)"
+    )
     conn.execute(
         "INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version',?)",
         (str(SCHEMA_VERSION),),
@@ -597,6 +617,82 @@ initialize_storage()
 
 
 # -------------------- User/profile/account compatibility --------------------
+
+
+def mark_user_started(tg_id: int) -> str:
+    """Durably register one Telegram user as a broadcast recipient."""
+    uid = int(tg_id)
+    if uid <= 0:
+        raise ValueError("Telegram ID نامعتبر است")
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT bot_started_at FROM users WHERE tg_id=?", (uid,)
+        ).fetchone()
+        existing = str(row[0] or "") if row else ""
+        if existing:
+            return existing
+    finally:
+        conn.close()
+    with _tx(immediate=True) as conn:
+        _ensure_user(conn, uid)
+        row = conn.execute(
+            "SELECT bot_started_at FROM users WHERE tg_id=?", (uid,)
+        ).fetchone()
+        existing = str(row[0] or "") if row else ""
+        if existing:
+            return existing
+        started_at = now_iso()
+        conn.execute(
+            "UPDATE users SET bot_started_at=? WHERE tg_id=?",
+            (started_at, uid),
+        )
+        return started_at
+
+
+def list_broadcast_recipient_ids(*, exclude_tg_ids=()) -> list[int]:
+    excluded = sorted({
+        int(value)
+        for value in (exclude_tg_ids or ())
+        if str(value or "").strip().lstrip("-").isdigit() and int(value) > 0
+    })
+    where = "WHERE bot_started_at!=''"
+    params: tuple = ()
+    if excluded:
+        placeholders = ",".join("?" for _ in excluded)
+        where += f" AND tg_id NOT IN ({placeholders})"
+        params = tuple(excluded)
+    conn = _connect()
+    try:
+        return [
+            int(row[0])
+            for row in conn.execute(
+                f"SELECT tg_id FROM users {where} ORDER BY tg_id", params
+            )
+        ]
+    finally:
+        conn.close()
+
+
+def broadcast_recipient_count(*, exclude_tg_ids=()) -> int:
+    excluded = sorted({
+        int(value)
+        for value in (exclude_tg_ids or ())
+        if str(value or "").strip().lstrip("-").isdigit() and int(value) > 0
+    })
+    where = "WHERE bot_started_at!=''"
+    params: tuple = ()
+    if excluded:
+        placeholders = ",".join("?" for _ in excluded)
+        where += f" AND tg_id NOT IN ({placeholders})"
+        params = tuple(excluded)
+    conn = _connect()
+    try:
+        return int(
+            conn.execute(f"SELECT COUNT(*) FROM users {where}", params).fetchone()[0]
+        )
+    finally:
+        conn.close()
 
 def get_user_profile(tg_id: int) -> dict:
     conn = _connect()

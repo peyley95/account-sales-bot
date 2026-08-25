@@ -22,6 +22,7 @@ for test_file in \
   test_expiry_notifications.py \
   test_admin_ui_v110.py \
   test_restore.py \
+  test_broadcast.py \
   test_public_release.py
 do
   python3 -m unittest discover -s tests -p "$test_file"

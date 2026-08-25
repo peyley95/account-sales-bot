@@ -222,7 +222,7 @@ class CardTransferStorageTests(TemporaryPaymentDatabase):
             ).fetchone()[0]
         finally:
             conn.close()
-        self.assertEqual(version, "27")
+        self.assertEqual(version, "28")
 
 
 class PaymentUiTests(TemporaryPaymentDatabase, unittest.IsolatedAsyncioTestCase):
