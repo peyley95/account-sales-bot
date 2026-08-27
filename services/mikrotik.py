@@ -602,7 +602,14 @@ def _routeros_usage_and_profile(api, username: str):
             # Prefer running-active, then waiting, then terminal states.
             candidates.sort(key=lambda x: (x[0], x[1] or datetime.min.replace(tzinfo=timezone.utc)), reverse=True)
             _, expiry, row_profile, profile_state = candidates[0]
-            actual_profile = actual_profile or row_profile
+            # Immediately after renewing an expired first-use account, User
+            # Manager's user monitor can temporarily keep the old
+            # ``actual-profile`` while user-profile already contains the new
+            # waiting assignment.  The assigned row selected above is the
+            # authoritative current package; preferring the stale monitor value
+            # can make the Web fallback read the expired profile and emit a
+            # false zero-volume notification before the first new connection.
+            actual_profile = row_profile or actual_profile
     except Exception as exc:
         if _is_transport_failure(exc):
             raise
@@ -671,9 +678,13 @@ def fetch_usage_and_expiry(username: str):
                         ul = _parse_routeros_bytes(data.get("upload"))
             if need_web_profile:
                 metadata = _web_profile_metadata(_um_get_user_profiles(s, current), profile)
-                if metadata.get("state") is not None:
+                # RouterOS user-profile is authoritative when it supplied a
+                # state.  The Web endpoint can lag briefly after a renewal, so
+                # it may only fill missing fields and must never replace a
+                # freshly observed waiting state with the old terminal state.
+                if um_profile_state is None and metadata.get("state") is not None:
                     um_profile_state = metadata["state"]
-                if metadata.get("starts_at") is not None:
+                if um_profile_starts_at is None and metadata.get("starts_at") is not None:
                     um_profile_starts_at = metadata["starts_at"]
                 if exp_dt is None and metadata.get("expiry") is not None:
                     exp_dt = metadata["expiry"]

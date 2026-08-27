@@ -1040,6 +1040,27 @@ class V2RayFirstUseTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/panel/api/clients/update/", calls[1][0])
         self.assertEqual(calls[1][1]["expiryTime"], -60 * 86_400_000)
 
+    def test_expired_renew_is_not_notified_before_first_use(self):
+        client = xui.XUIClient()
+        calls = []
+        old_client = {
+            "email": "customer", "subId": "sub", "id": "uuid",
+            "totalGB": 10 * 1024 ** 3, "expiryTime": 1,
+            "enable": False, "tgId": 123,
+        }
+        with (
+            patch.object(client, "status", return_value={"active": False, "waiting_first_use": False}),
+            patch.object(client, "get_client", return_value={"client": old_client}),
+            patch.object(client, "post", side_effect=lambda path, payload=None: calls.append((path, payload)) or {"success": True}),
+        ):
+            client.renew("customer", 20, 60)
+
+        renewed_payload = calls[1][1]
+        status = xui.XUIClient.status_from(renewed_payload, {"up": 0, "down": 0})
+        self.assertTrue(status["waiting_first_use"])
+        self.assertEqual(status["remaining_bytes"], 20 * 1024 ** 3)
+        self.assertIsNone(bot.classify_v2ray_status(status))
+
     async def test_v2ray_waiting_status_ui_is_explicit(self):
         message = FakeMessage()
         waiting = {
@@ -1128,6 +1149,101 @@ class OpenVPNUserManagerStatusTests(unittest.TestCase):
                 self.assertEqual(result["um_profile_state_label"], "فعال نشده")
                 self.assertEqual(result["um_profile_starts_at"], 0)
                 self.assertEqual(result["um_profile_starts_at_label"], "از اولین استفاده")
+
+    def test_renewed_waiting_assignment_wins_over_stale_actual_profile(self):
+        class Pool:
+            def disconnect(self):
+                pass
+
+        requested_profiles = []
+
+        class UserResource:
+            def get(self, **_kwargs):
+                return [{".id": "*1", "name": "customer"}]
+
+            def call(self, _command, _params):
+                return [{
+                    "total-download": 10 * 1024 ** 3,
+                    "total-upload": 0,
+                    "actual-profile": "OLD-EXPIRED",
+                }]
+
+        class UserProfileResource:
+            def get(self, **_kwargs):
+                return [
+                    {"profile": "OLD-EXPIRED", "state": "used"},
+                    {"profile": "NEW-FIRST-USE", "state": "waiting"},
+                ]
+
+        class ProfileResource:
+            def get(self, **kwargs):
+                requested_profiles.append(kwargs.get("name"))
+                return [{"name": kwargs.get("name"), "starts-when": "first-auth"}]
+
+        resources = {
+            "/user-manager/user": UserResource(),
+            "/user-manager/user-profile": UserProfileResource(),
+            "/user-manager/profile": ProfileResource(),
+        }
+
+        class Api:
+            def get_resource(self, path):
+                return resources[path]
+
+        with (
+            patch.object(mikrotik, "connect_mikrotik", return_value=(Pool(), Api())),
+            patch.object(mikrotik, "_find_user_and_password", return_value=("customer", "123456")),
+            patch.object(mikrotik, "_um_session", side_effect=AssertionError("waiting profile must not need Web fallback")),
+        ):
+            result = mikrotik.fetch_usage_and_expiry("customer")
+
+        self.assertEqual(requested_profiles, ["NEW-FIRST-USE"])
+        self.assertEqual(result["profile"], "NEW-FIRST-USE")
+        self.assertEqual(result["um_profile_state"], 0)
+        self.assertEqual(result["um_profile_starts_at"], 0)
+        self.assertIsNone(
+            bot.classify_openvpn_status(result, quota_bytes=10 * 1024 ** 3)
+        )
+
+    def test_stale_web_state_cannot_override_routeros_waiting_state(self):
+        class Pool:
+            def disconnect(self):
+                pass
+
+        class Session:
+            def close(self):
+                pass
+
+        stale_web_profiles = {
+            "success": True,
+            "data": {
+                "profiles": [{
+                    "name": "NEW-FIRST-USE",
+                    "state": 3,
+                    "startsAt": 0,
+                    "expAfter": "0s",
+                }]
+            },
+        }
+        with (
+            patch.object(mikrotik, "connect_mikrotik", return_value=(Pool(), object())),
+            patch.object(mikrotik, "_find_user_and_password", return_value=("customer", "123456")),
+            patch.object(
+                mikrotik,
+                "_routeros_usage_and_profile",
+                return_value=(10 * 1024 ** 3, 0, "NEW-FIRST-USE", None, "waiting", None),
+            ),
+            patch.object(mikrotik, "_um_session", return_value=Session()),
+            patch.object(mikrotik, "_um_login"),
+            patch.object(mikrotik, "_um_get_user_profiles", return_value=stale_web_profiles),
+        ):
+            result = mikrotik.fetch_usage_and_expiry("customer")
+
+        self.assertEqual(result["um_profile_state"], 0)
+        self.assertEqual(result["um_profile_starts_at"], 0)
+        self.assertIsNone(
+            bot.classify_openvpn_status(result, quota_bytes=10 * 1024 ** 3)
+        )
 
     def test_never_used_web_profile_is_not_misclassified_as_expired(self):
         class Pool:
